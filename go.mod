@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/ClickHouse/clickhouse-go/v2 v2.47.0
-	github.com/go-rio/rio v0.6.0
+	github.com/go-rio/rio v0.7.0
 )
 
 require (
@@ -24,8 +24,3 @@ require (
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
 	golang.org/x/sys v0.46.0 // indirect
 )
-
-// Local development against the unreleased rio core: rio.ClickHouse ships in
-// v0.7.0. Release flow — after the core tags v0.7.0, bump the require above
-// to v0.7.0 and delete this replace; released driver modules are replace-free.
-replace github.com/go-rio/rio => ../rio
