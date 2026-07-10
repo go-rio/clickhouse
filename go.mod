@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/ClickHouse/clickhouse-go/v2 v2.47.0
-	github.com/go-rio/rio v0.7.1
+	github.com/go-rio/rio v0.7.2
 )
 
 require (

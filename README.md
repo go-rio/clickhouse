@@ -170,30 +170,21 @@ Two facts to internalize:
 
 ## Time
 
-rio inlines every `time.Time` argument into the executed statement as an
-explicit parse call:
-
-```sql
-parseDateTime64BestEffort('2026-01-02 03:04:05.123456+00:00', 6, 'UTC')
-```
-
-Two driver/server facts force this shape: clickhouse-go's client-side binder
-silently truncates a `time.Time` argument to whole seconds, and the implicit
-`String→DateTime64` cast that comparisons use rejects offset-carrying text on
-servers before 26.x (`TYPE_MISMATCH`, immune to every session setting). The
-explicit function is the one channel every supported server version accepts —
-INSERT and comparisons alike — with microseconds intact and the offset
-pinning the instant regardless of any column timezone attribute, so the same
-instant lands correctly in `DateTime64(6)` and `DateTime64(6, 'Asia/Shanghai')`
-and survives an insert-then-reload `Equal` comparison. The inlining happens at
-execution: cached SQL and compiled queries stay parameterized, and the full
-time literal is visible in query logs, hooks, and `system.query_log`.
+rio binds `time.Time` as fixed-format text with an explicit UTC offset —
+`2006-01-02 15:04:05.000000+00:00` — because clickhouse-go's client-side
+binder silently truncates a `time.Time` argument to whole seconds. On
+ClickHouse 26+ (this module's server floor, see Requirements) that text
+parses natively in INSERT and comparisons alike, with microseconds intact
+and the offset pinning the instant regardless of any column timezone
+attribute: the same instant lands correctly in `DateTime64(6)` and
+`DateTime64(6, 'Asia/Shanghai')` and survives an insert-then-reload `Equal`
+comparison.
 
 | Column type | Behavior |
 |---|---|
 | `DateTime64(6[, tz])` | **recommended** — full microsecond round-trip, any timezone attribute |
 | `DateTime64(3)` | stores, silently truncating to milliseconds (schema responsibility, like MySQL `DATETIME(3)`) |
-| `DateTime` (seconds) | comparisons work (numeric coercion); INSERTs are rejected loudly on every version — the VALUES section refuses to narrow the inlined `DateTime64` expression. Use `DateTime64` for columns rio writes |
+| `DateTime` (seconds) | stores, silently truncating to whole seconds (same schema-responsibility class) |
 | `Date` / `Date32` | rejected server-side for rio's time binding — use `DateTime64` for `time.Time` fields |
 
 Range: ClickHouse silently clamps out-of-range times to the
@@ -206,18 +197,16 @@ Reads come back in the **column's** timezone location; the instant compares
 `Equal` to what you wrote (epoch storage), same as the location differences
 you may see on PostgreSQL/MySQL.
 
-## Server version notes
+## Requirements
 
-- **Pre-1970 fractional seconds parse wrong before 26.x.** Servers < 26
-  mis-parse the fractional part of negative-epoch times by *subtracting* it:
-  `1950-01-02 03:04:05.123456` lands as `1950-01-02 03:04:04.876544` (whole
-  seconds are exact; a `.5` fraction lands exactly one second low). The
-  defect sits in the server's parser and affects every input channel,
-  including rio's `parseDateTime64BestEffort` inlining. rio does not
-  compensate client-side — a fixed server would then be wrong in the other
-  direction. On 26.x the round trip is exact.
-- `WhereHas`/`WhereHasNot` need 25.8 LTS (correlated `EXISTS` GA); older
-  servers reject the query loudly.
+**ClickHouse server 26.0+.** 26 is where the server natively parses rio's
+offset-carrying time text in both INSERT and comparisons; on 25.x and
+earlier, any `time.Time` used in a query condition fails with
+`TYPE_MISMATCH` (the comparison's implicit `String→DateTime64` cast ignores
+every input-format session setting), so those servers are not supported. The
+floor also subsumes the older per-feature ones — `WhereHas` needed 25.8's
+correlated `EXISTS`, `RelLimit` 22.x's window functions — and 26 fixed the
+25.x parser defect that mirrored the fractional part of pre-1970 times.
 
 ## Performance notes
 
@@ -242,10 +231,8 @@ you may see on PostgreSQL/MySQL.
 
 | Component | Floor | Why |
 |---|---|---|
+| ClickHouse server | **26.0** | native offset-text time parsing in INSERT and comparisons (see Requirements); subsumes the per-feature floors (`WhereHas` 25.8, `RelLimit` 22.x, lightweight `DELETE` 23.3) |
 | clickhouse-go | **v2.47.0** (go.mod enforced) | first release whose client-side binder is quote-aware: earlier versions rewrite `?` inside string literals (#1860), breaking any SQL that contains one |
-| ClickHouse server | 22.x | `RelLimit` uses window functions (21.9+, stable in 22.x) |
-| ClickHouse server | 25.8 LTS | `WhereHas`/`WhereHasNot` render correlated `EXISTS`, GA since 25.8; older servers reject it loudly |
-| ClickHouse server | 23.3 | lightweight `DELETE FROM` in the mutation escape hatch |
 
 ## License
 

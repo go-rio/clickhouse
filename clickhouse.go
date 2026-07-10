@@ -10,9 +10,12 @@
 //     malformed one fails at startup instead of on the first query. The DSN
 //     is then handed to the driver untouched — no parameter is ever pinned or
 //     rewritten, because ClickHouse has none that rio's correctness depends
-//     on: time.Time arguments are inlined server-side as explicit
-//     parseDateTime64BestEffort calls, independent of the server's
-//     input-format settings (see the rio docs).
+//     on (time encoding carries its own offset, see the rio docs).
+//
+// The supported server floor is ClickHouse 26.0+: that is where INSERT and
+// comparisons natively parse rio's offset-carrying time text — on earlier
+// servers a time.Time in a query condition fails with TYPE_MISMATCH (see
+// the README's Requirements section).
 //
 // Unlike the other go-rio driver modules there is no error translator here,
 // and that is a documented dialect fact, not a gap: ClickHouse has no unique
