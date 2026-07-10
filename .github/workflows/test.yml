@@ -27,7 +27,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       clickhouse:
-        image: clickhouse/clickhouse-server:26
+        image: clickhouse/clickhouse-server:26.1
         env:
           CLICKHOUSE_DB: rio_test
           CLICKHOUSE_USER: rio
