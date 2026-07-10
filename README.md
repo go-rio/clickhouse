@@ -1,8 +1,9 @@
 # clickhouse
 
-[![Doc](https://pkg.go.dev/badge/github.com/go-rio/clickhouse)](https://pkg.go.dev/github.com/go-rio/clickhouse)
+[![Doc](https://pkg.go.dev/badge/github.com/go-rio/clickhouse.svg)](https://pkg.go.dev/github.com/go-rio/clickhouse)
 [![Go](https://img.shields.io/github/go-mod/go-version/go-rio/clickhouse)](https://go.dev/)
-[![Test](https://github.com/go-rio/clickhouse/actions/workflows/test.yml/badge.svg)](https://github.com/go-rio/clickhouse/actions)
+[![Release](https://img.shields.io/github/release/go-rio/clickhouse.svg)](https://github.com/go-rio/clickhouse/releases)
+[![Test](https://github.com/go-rio/clickhouse/actions/workflows/test.yml/badge.svg)](https://github.com/go-rio/clickhouse/actions/workflows/test.yml)
 [![License](https://img.shields.io/github/license/go-rio/clickhouse)](https://opensource.org/license/MIT)
 
 ClickHouse driver module for [rio](https://github.com/go-rio/rio), built on the
