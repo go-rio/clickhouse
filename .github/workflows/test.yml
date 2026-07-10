@@ -36,7 +36,7 @@ jobs:
           - 9000:9000
           - 8123:8123
         options: >-
-          --health-cmd "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1"
+          --health-cmd "clickhouse-client --query 'SELECT 1'"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
