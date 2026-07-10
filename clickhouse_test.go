@@ -201,11 +201,10 @@ func TestWithStmtCachePanics(t *testing.T) {
 
 // --- no error translator, by design ---
 
-// ClickHouse has no unique or foreign key constraints, so this module
-// installs no translator: a server exception must come back untranslated —
-// never rio.ErrDuplicateKey / rio.ErrForeignKeyViolated — with the
-// *clickhouse.Exception intact in the chain for errors.As. Installing a
-// translator here would break this documented dialect fact.
+// ClickHouse has no unique or foreign key constraints, so this module installs
+// no translator: a server exception comes back untranslated — never
+// rio.ErrDuplicateKey / rio.ErrForeignKeyViolated — with the
+// *clickhouse.Exception intact in the chain for errors.As.
 func TestNoErrorTranslatorInstalled(t *testing.T) {
 	exc := &ch.Exception{Code: 60, Name: "UNKNOWN_TABLE", Message: "table widgets does not exist"}
 	s := &stubDB{failErr: exc}
