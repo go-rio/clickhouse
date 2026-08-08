@@ -1,10 +1,10 @@
 module github.com/go-rio/clickhouse
 
-go 1.25.0
+go 1.27rc2
 
 require (
 	github.com/ClickHouse/clickhouse-go/v2 v2.47.0
-	github.com/go-rio/rio v0.9.0
+	github.com/go-rio/rio v0.10.0
 )
 
 require (

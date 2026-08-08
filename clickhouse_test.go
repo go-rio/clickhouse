@@ -17,8 +17,6 @@ import (
 	"github.com/go-rio/rio"
 )
 
-// --- eager DSN validation ---
-
 func TestOpenValidatesDSNEagerly(t *testing.T) {
 	valid := []string{
 		"clickhouse://127.0.0.1:9000",
@@ -55,9 +53,6 @@ func TestOpenValidatesDSNEagerly(t *testing.T) {
 	}
 }
 
-// Open validates but never dials: a DSN pointing at a dead port succeeds and
-// only PingContext (or the first query) reports the connection failure —
-// same contract as the other go-rio driver modules and database/sql itself.
 func TestOpenDoesNotConnect(t *testing.T) {
 	db, err := Open("clickhouse://127.0.0.1:1/nowhere?dial_timeout=200ms")
 	if err != nil {
@@ -72,15 +67,11 @@ func TestOpenDoesNotConnect(t *testing.T) {
 	}
 }
 
-// --- New: dialect wiring and option pass-through ---
-
-// stubDB is a minimal database/sql driver recording every statement, so the
-// tests can assert what rio renders under the ClickHouse dialect without a
-// server.
+// stubDB records SQL without requiring a ClickHouse server.
 type stubDB struct {
 	mu      sync.Mutex
 	queries []string
-	failErr error // returned by every Exec/Query when set
+	failErr error
 }
 
 func (s *stubDB) logged() []string {
@@ -182,10 +173,7 @@ func (h recordingHook) AfterQuery(_ context.Context, e *rio.QueryEvent) {
 	*h.saw = append(*h.saw, e.Op+":"+e.Query)
 }
 
-// WithStmtCache is a construction-time misuse on ClickHouse — clickhouse-go
-// implements Prepare only for INSERT batching, so a cached SELECT would fail
-// on first use. The core panics in rio.New; this pins that it surfaces
-// through the driver module's constructors too.
+// clickhouse-go prepares only INSERT batches, so rio rejects WithStmtCache.
 func TestWithStmtCachePanics(t *testing.T) {
 	defer func() {
 		r := recover()
@@ -199,12 +187,7 @@ func TestWithStmtCachePanics(t *testing.T) {
 	New(sql.OpenDB(stubConnector{&stubDB{}}), rio.WithStmtCache())
 }
 
-// --- no error translator, by design ---
-
-// ClickHouse has no unique or foreign key constraints, so this module installs
-// no translator: a server exception comes back untranslated — never
-// rio.ErrDuplicateKey / rio.ErrForeignKeyViolated — with the
-// *clickhouse.Exception intact in the chain for errors.As.
+// Server exceptions remain reachable without matching rio constraint errors.
 func TestNoErrorTranslatorInstalled(t *testing.T) {
 	exc := &ch.Exception{Code: 60, Name: "UNKNOWN_TABLE", Message: "table widgets does not exist"}
 	s := &stubDB{failErr: exc}
@@ -224,9 +207,7 @@ func TestNoErrorTranslatorInstalled(t *testing.T) {
 	}
 }
 
-// --- README examples must compile ---
-
-// compile-time shadow of the README usage snippets; never executed.
+// Type-check the README usage without executing it.
 var _ = func() {
 	db, err := Open("clickhouse://default@127.0.0.1:9000/analytics?compress=lz4")
 	if err != nil {
@@ -246,10 +227,6 @@ var _ = func() {
 	_ = db.Unwrap() // native batch & pool tuning live on the *sql.DB
 }
 
-// --- integration, gated by RIO_CLICKHOUSE_DSN ---
-
-// openTestDB connects to RIO_CLICKHOUSE_DSN or skips, e.g.
-// RIO_CLICKHOUSE_DSN="clickhouse://default@localhost:19000".
 func openTestDB(t *testing.T) *rio.DB {
 	t.Helper()
 	dsn := os.Getenv("RIO_CLICKHOUSE_DSN")
@@ -275,8 +252,6 @@ type Reading struct {
 
 func (Reading) TableName() string { return "rio_ch_readings" }
 
-// TestIntegration smokes the full constructor→insert→read path against a
-// real server, including rio's time encoding surviving a reload Equal.
 func TestIntegration(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
@@ -284,8 +259,10 @@ func TestIntegration(t *testing.T) {
 	if _, err := rio.Exec(ctx, db, "DROP TABLE IF EXISTS rio_ch_readings"); err != nil {
 		t.Fatalf("drop: %v", err)
 	}
-	if _, err := rio.Exec(ctx, db,
-		"CREATE TABLE rio_ch_readings (id UInt64, at DateTime64(6, 'UTC'), v Float64) ENGINE = MergeTree ORDER BY id"); err != nil {
+	const createReadings = "CREATE TABLE rio_ch_readings " +
+		"(id UInt64, at DateTime64(6, 'UTC'), v Float64) " +
+		"ENGINE = MergeTree ORDER BY id"
+	if _, err := rio.Exec(ctx, db, createReadings); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	t.Cleanup(func() { _, _ = rio.Exec(ctx, db, "DROP TABLE IF EXISTS rio_ch_readings") })
@@ -303,11 +280,7 @@ func TestIntegration(t *testing.T) {
 	}
 }
 
-// TestIntegrationQuoteAwareBinding pins the go.mod floor: clickhouse-go ≥
-// v2.47.0 is the first release whose client-side binder skips string
-// literals and comments while scanning for ?. On an older driver this query
-// would have its quoted ? substituted and the real placeholder starved —
-// a manual downgrade below the floor fails here first.
+// clickhouse-go v2.47.0 or newer must ignore placeholders in protected SQL.
 func TestIntegrationQuoteAwareBinding(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
