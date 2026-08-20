@@ -8,7 +8,7 @@ jobs:
   test:
     strategy:
       matrix:
-        go: [ "oldstable", "stable" ]
+        go: ["stable"]
         platform: [ ubuntu-latest, macos-latest, windows-latest ]
     runs-on: ${{ matrix.platform }}
     steps:
@@ -27,7 +27,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       clickhouse:
-        image: clickhouse/clickhouse-server:26.5-alpine
+        image: clickhouse/clickhouse-server:26.7-alpine
         env:
           CLICKHOUSE_DB: rio_test
           CLICKHOUSE_USER: rio
@@ -36,7 +36,7 @@ jobs:
           - 9000:9000
           - 8123:8123
         options: >-
-          --health-cmd "clickhouse-client --query 'SELECT 1'"
+          --health-cmd "clickhouse-client --user rio --password rio --query 'SELECT 1'"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20

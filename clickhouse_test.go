@@ -280,7 +280,7 @@ func TestIntegration(t *testing.T) {
 	}
 }
 
-// clickhouse-go v2.47.0 or newer must ignore placeholders in protected SQL.
+// clickhouse-go v2.48.0 must ignore placeholders in protected SQL.
 func TestIntegrationQuoteAwareBinding(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()

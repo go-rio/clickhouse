@@ -112,7 +112,7 @@ to the server. Runtime slices expand in `IN (?)`.
 
 Important details:
 
-- clickhouse-go v2.47.0 or newer protects `?` in quoted regions and supported
+- clickhouse-go v2.48.0 or newer protects `?` in quoted regions and supported
   comments.
 - With arguments, rio rejects `?` in `$tag$...$tag$` heredocs and `//`
   comments because the driver does not protect those regions. Bind the value
@@ -131,9 +131,9 @@ instant even when the column has another timezone. `DateTime64(3)` and
 `DateTime` truncate to their schema precision; `Date` and `Date32` reject this
 binding.
 
-ClickHouse silently clamps out-of-range `DateTime64` values, so rio rejects
-times outside `[1900-01-01, 2299-12-31]`. This includes zero `time.Time`; use
-`*time.Time` with `Nullable(DateTime64(6))` for a missing value.
+ClickHouse 26.7 extends `DateTime64(6)` text values to years 0001–9999. rio
+accepts that range, including zero `time.Time`, and rejects values outside it.
+Use `*time.Time` with `Nullable(DateTime64(6))` when the value is absent.
 
 `[]byte`, `json.RawMessage`, and other named byte slices bind as one ClickHouse
 `String`, not `Array(UInt8)`; a typed nil slice binds SQL `NULL`. Types that
@@ -174,8 +174,8 @@ and execution errors otherwise remain in rio's normal error chain.
 | Component | Minimum | Reason |
 |---|---|---|
 | Go | **1.27.0** | Module language version |
-| ClickHouse server | **26.0** | Offset-carrying time text in INSERT and comparisons |
-| clickhouse-go | **v2.47.0** | Quote-aware client-side placeholder binding |
+| ClickHouse server | **26.7** | Extended DateTime64 range and offset-carrying time text |
+| clickhouse-go | **v2.48.0** | Quote-aware client-side placeholder binding |
 
 ## Contributing
 
