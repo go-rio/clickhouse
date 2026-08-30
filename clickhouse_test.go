@@ -187,7 +187,6 @@ func TestWithStmtCachePanics(t *testing.T) {
 	New(sql.OpenDB(stubConnector{&stubDB{}}), rio.WithStmtCache())
 }
 
-// Server exceptions remain reachable without matching rio constraint errors.
 func TestNoErrorTranslatorInstalled(t *testing.T) {
 	exc := &ch.Exception{Code: 60, Name: "UNKNOWN_TABLE", Message: "table widgets does not exist"}
 	s := &stubDB{failErr: exc}
@@ -280,7 +279,7 @@ func TestIntegration(t *testing.T) {
 	}
 }
 
-// clickhouse-go v2.48.0 must ignore placeholders in protected SQL.
+// The driver must ignore placeholders inside quoted literals and comments.
 func TestIntegrationQuoteAwareBinding(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()

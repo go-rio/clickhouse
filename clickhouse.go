@@ -1,11 +1,10 @@
 // Package clickhouse connects rio to ClickHouse through clickhouse-go v2's
 // database/sql driver.
 //
-// ClickHouse 26.0 or newer is required for rio's offset-carrying time values.
-// This package installs no constraint-error translator because ClickHouse has
-// no unique or foreign key constraints; server errors remain available as
-// *clickhouse.Exception through errors.As. Dialect grammar and capability
-// checks live in github.com/go-rio/rio.
+// ClickHouse 26.7 or newer is required for rio's offset-carrying time values.
+// No constraint-error translator is installed (ClickHouse has no unique or
+// foreign key constraints); server errors remain reachable as
+// *clickhouse.Exception through errors.As.
 package clickhouse
 
 import (
@@ -19,8 +18,8 @@ import (
 const driverName = "clickhouse"
 
 // Open validates a ClickHouse DSN and wraps the resulting database/sql pool.
-// It passes the DSN through unchanged and does not connect; use
-// db.Unwrap().PingContext to verify connectivity.
+// The DSN passes through unchanged; it does not connect (ping via
+// db.Unwrap().PingContext).
 func Open(dsn string, opts ...rio.Option) (*rio.DB, error) {
 	if _, err := clickhouse.ParseDSN(dsn); err != nil {
 		return nil, fmt.Errorf("clickhouse: open: %w", err)
