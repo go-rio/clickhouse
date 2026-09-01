@@ -543,7 +543,7 @@ func (e *timeEnc) append(v any) error {
 		n = t.UnixNano() / e.unit
 	}
 	// Date and DateTime are unsigned and narrow; out-of-range instants
-	// (the zero time.Time above all) would otherwise wrap silently.
+	// would otherwise wrap silently.
 	if e.size == 2 && (n < 0 || n > 65535) {
 		return fmt.Errorf("chproto: %v is outside the Date range [1970-01-01, 2149-06-06]", t)
 	}
