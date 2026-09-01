@@ -1,9 +1,6 @@
 package chproto
 
-import (
-	"fmt"
-	"io"
-)
+import "fmt"
 
 // Column describes one block column.
 type Column struct {
@@ -12,21 +9,40 @@ type Column struct {
 }
 
 // Rows streams a query's result blocks. Column decoders and their buffers
-// are built on the first block and reused for every following one; value
+// build on the first block and are reused for every following one — and,
+// when the next query returns the same column shape, across queries; value
 // accessors return borrowed data valid only until the next Next call.
 type Rows struct {
-	conn *Conn
-	cols []Column
-	decs []Decoder
+	conn  *Conn
+	cols  []Column
+	decs  []Decoder
+	names []string // built by Names, reset with the column shape
 
-	rows int // rows in the current block
-	idx  int // current row, -1 before the first Next of a block
-	done bool
-	err  error
+	rows      int // rows in the current block
+	idx       int // current row, -1 before the first Next of a block
+	blockSeen bool
+	done      bool
+	err       error
+}
+
+// reset readies the Rows for a fresh query, keeping decoders for reuse.
+func (r *Rows) reset() {
+	r.rows, r.idx, r.blockSeen, r.done, r.err = 0, -1, false, false, nil
 }
 
 // Columns returns the result's column descriptors.
 func (r *Rows) Columns() []Column { return r.cols }
+
+// Names returns the column names, built once per column shape.
+func (r *Rows) Names() []string {
+	if r.names == nil {
+		r.names = make([]string, len(r.cols))
+		for i, c := range r.cols {
+			r.names[i] = c.Name
+		}
+	}
+	return r.names
+}
 
 // Decoder exposes column i's typed accessor for the current row.
 func (r *Rows) Decoder(i int) Decoder { return r.decs[i] }
@@ -60,14 +76,11 @@ func (r *Rows) Next() bool {
 func (r *Rows) pump() error {
 	c := r.conn
 	r.rows, r.idx = 0, -1
-	if r.done {
-		return nil
-	}
 	for {
-		pt, err := c.readUvarint()
+		pt, err := c.nextPacket()
 		if err != nil {
-			r.err = c.fail(err)
-			return r.err
+			r.err = err
+			return err
 		}
 		switch pt {
 		case serverData:
@@ -87,30 +100,6 @@ func (r *Rows) pump() error {
 			r.err = c.readException()
 			r.done = true
 			return r.err
-		case serverProgress:
-			if err := c.skipProgress(); err != nil {
-				r.err = c.fail(err)
-				return r.err
-			}
-		case serverProfileInfo:
-			if err := c.skipProfileInfo(); err != nil {
-				r.err = c.fail(err)
-				return r.err
-			}
-		case serverTotals, serverExtremes, serverLog, serverProfileEvents:
-			if err := c.skipMetaBlock(); err != nil {
-				r.err = c.fail(err)
-				return r.err
-			}
-		case serverTableColumns:
-			if err := c.skipString(); err != nil {
-				r.err = c.fail(err)
-				return r.err
-			}
-			if err := c.skipString(); err != nil {
-				r.err = c.fail(err)
-				return r.err
-			}
 		default:
 			r.err = c.fail(fmt.Errorf("chproto: unexpected packet %d", pt))
 			return r.err
@@ -140,38 +129,70 @@ func (r *Rows) readBlock() (int, error) {
 		return 0, nil // stream-boundary marker block
 	}
 
-	first := r.decs == nil
-	if first {
-		r.cols = make([]Column, ncols)
-		r.decs = make([]Decoder, ncols)
-	} else if ncols != len(r.cols) {
-		return 0, c.fail(fmt.Errorf("chproto: block column count changed: %d != %d", ncols, len(r.cols)))
-	}
-	for i := range ncols {
-		name, err := c.readString()
-		if err != nil {
-			return 0, c.fail(err)
+	if !r.blockSeen {
+		// The query's first block establishes the shape. Decoders left by an
+		// earlier query on this Rows are reused column-for-column when the
+		// type matches — their buffers are already sized — and rebuilt
+		// otherwise.
+		r.blockSeen = true
+		if ncols != len(r.cols) {
+			r.names = nil
 		}
-		typ, err := c.readString()
-		if err != nil {
-			return 0, c.fail(err)
-		}
-		flag, err := c.readByte()
-		if err != nil {
-			return 0, c.fail(err)
-		}
-		if flag != 0 {
-			return 0, c.fail(fmt.Errorf("chproto: column %q uses custom serialization", name))
-		}
-		if first {
-			r.cols[i] = Column{Name: name, Type: typ}
-			dec, err := newDecoder(typ, c.timezone)
+		cols := make([]Column, 0, ncols)
+		decs := make([]Decoder, 0, ncols)
+		for i := range ncols {
+			name, err := c.readString()
 			if err != nil {
 				return 0, c.fail(err)
 			}
-			r.decs[i] = dec
-		} else if typ != r.cols[i].Type {
-			return 0, c.fail(fmt.Errorf("chproto: column %q type changed: %s != %s", name, typ, r.cols[i].Type))
+			typ, err := c.readString()
+			if err != nil {
+				return 0, c.fail(err)
+			}
+			if err := c.readColumnFlag(i); err != nil {
+				return 0, err
+			}
+			if i < len(r.cols) && typ == r.cols[i].Type {
+				decs = append(decs, r.decs[i])
+			} else {
+				dec, err := newDecoder(typ, c.timezone)
+				if err != nil {
+					return 0, c.fail(err)
+				}
+				decs = append(decs, dec)
+				r.names = nil
+			}
+			if i < len(r.cols) && name != r.cols[i].Name {
+				r.names = nil
+			}
+			cols = append(cols, Column{Name: name, Type: typ})
+			if nrows > 0 {
+				if err := decs[i].read(c, nrows); err != nil {
+					return 0, c.fail(err)
+				}
+			}
+		}
+		r.cols, r.decs = cols, decs
+		return nrows, nil
+	}
+	// Later blocks of the same result must keep the shape; verify against
+	// scratch without allocating.
+	if ncols != len(r.cols) {
+		return 0, c.fail(fmt.Errorf("chproto: block column count changed: %d != %d", ncols, len(r.cols)))
+	}
+	for i := range ncols {
+		if err := c.skipString(); err != nil { // name is fixed per shape
+			return 0, c.fail(err)
+		}
+		typ, err := c.readTypeScratch()
+		if err != nil {
+			return 0, c.fail(err)
+		}
+		if typ != r.cols[i].Type {
+			return 0, c.fail(fmt.Errorf("chproto: column %d type changed: %s != %s", i, typ, r.cols[i].Type))
+		}
+		if err := c.readColumnFlag(i); err != nil {
+			return 0, err
 		}
 		if nrows > 0 {
 			if err := r.decs[i].read(c, nrows); err != nil {
@@ -188,13 +209,8 @@ func (r *Rows) Close() error {
 		if err := r.pump(); err != nil {
 			break
 		}
-		// discard fetched rows
-		r.idx = r.rows
 	}
-	if r.err != nil && r.err != io.EOF {
-		return r.err
-	}
-	return nil
+	return r.err
 }
 
 // Err reports the first error hit while streaming.

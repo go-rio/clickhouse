@@ -3,11 +3,16 @@ package chproto
 import (
 	"database/sql/driver"
 	"fmt"
+	"math"
 	"reflect"
 	"strconv"
 	"strings"
 	"time"
 )
+
+// TimeFormat is rio's ClickHouse time binding layout; interpolated literals
+// and the copy path's text parsing share it.
+const TimeFormat = "2006-01-02 15:04:05.000000+00:00"
 
 // Interpolate substitutes ? placeholders with SQL literals, honoring
 // ClickHouse quoting: '...' strings (with \ escapes), `...` and "..."
@@ -18,7 +23,15 @@ func Interpolate(query string, args []any) (string, error) {
 	if len(args) == 0 && !strings.ContainsRune(query, '?') {
 		return query, nil
 	}
-	buf := make([]byte, 0, len(query)+32*len(args))
+	size := len(query)
+	for _, a := range args {
+		if s, ok := a.(string); ok {
+			size += len(s) + 2
+		} else {
+			size += 20
+		}
+	}
+	buf := make([]byte, 0, size)
 	arg := 0
 	for i := 0; i < len(query); i++ {
 		ch := query[i]
@@ -163,7 +176,7 @@ func appendLiteral(buf []byte, v any) ([]byte, error) {
 	case time.Time:
 		// rio binds times as text before they reach the channel; direct Raw
 		// arguments still deserve a correct literal.
-		return appendQuoted(buf, x.UTC().Format("2006-01-02 15:04:05.000000+00:00")), nil
+		return appendQuoted(buf, x.UTC().Format(TimeFormat)), nil
 	}
 	rv := reflect.ValueOf(v)
 	switch rv.Kind() {
@@ -185,7 +198,7 @@ func appendLiteral(buf []byte, v any) ([]byte, error) {
 }
 
 func appendFloat(buf []byte, f float64) ([]byte, error) {
-	if f != f || f > 1.7976931348623157e308 || f < -1.7976931348623157e308 {
+	if math.IsNaN(f) || math.IsInf(f, 0) {
 		return nil, fmt.Errorf("chproto: cannot bind non-finite float %v", f)
 	}
 	return strconv.AppendFloat(buf, f, 'g', -1, 64), nil

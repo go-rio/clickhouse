@@ -9,6 +9,86 @@ import (
 	"time"
 )
 
+// grow resizes buf to n elements, reallocating only when capacity lacks.
+func grow[T any](buf []T, n int) []T {
+	if cap(buf) < n {
+		buf = make([]T, n)
+	}
+	return buf[:n]
+}
+
+// pow10Units returns the tick size in nanoseconds for a DateTime64 precision.
+func pow10Units(precision int) int64 {
+	unit := int64(1)
+	for i := precision; i < 9; i++ {
+		unit *= 10
+	}
+	return unit
+}
+
+// parseFixedStringN parses "FixedString(n)".
+func parseFixedStringN(typ string) (int, error) {
+	n, err := strconv.Atoi(typ[len("FixedString(") : len(typ)-1])
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("chproto: bad type %q", typ)
+	}
+	return n, nil
+}
+
+// fixedWidth reports a type's per-value wire width, or -1 for String.
+func fixedWidth(typ string) (int, error) {
+	switch typ {
+	case "UInt8", "Int8", "Bool":
+		return 1, nil
+	case "UInt16", "Int16", "Date":
+		return 2, nil
+	case "UInt32", "Int32", "Float32", "DateTime", "Date32":
+		return 4, nil
+	case "UInt64", "Int64", "Float64":
+		return 8, nil
+	case "UUID":
+		return 16, nil
+	case "String":
+		return -1, nil
+	}
+	switch {
+	case strings.HasPrefix(typ, "DateTime64("):
+		return 8, nil
+	case strings.HasPrefix(typ, "DateTime("):
+		return 4, nil
+	case strings.HasPrefix(typ, "Enum8("):
+		return 1, nil
+	case strings.HasPrefix(typ, "Enum16("):
+		return 2, nil
+	case strings.HasPrefix(typ, "FixedString("):
+		return parseFixedStringN(typ)
+	}
+	return 0, fmt.Errorf("chproto: unsupported column type %q", typ)
+}
+
+// skipColumnData discards one column's payload without decoding it.
+func skipColumnData(c *Conn, typ string, rows int) error {
+	if inner, ok := strings.CutPrefix(typ, "Nullable("); ok {
+		if err := c.skipN(rows); err != nil { // null mask
+			return err
+		}
+		return skipColumnData(c, inner[:len(inner)-1], rows)
+	}
+	width, err := fixedWidth(typ)
+	if err != nil {
+		return err
+	}
+	if width >= 0 {
+		return c.skipN(rows * width)
+	}
+	for range rows {
+		if err := c.skipString(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Kind is the access class a decoder serves; the SPI layer picks the
 // matching typed sink once per column.
 type Kind uint8
@@ -58,11 +138,7 @@ type fixedInt struct {
 }
 
 func (d *fixedInt) read(c *Conn, rows int) error {
-	n := rows * d.size
-	if cap(d.buf) < n {
-		d.buf = make([]byte, n)
-	}
-	d.buf = d.buf[:n]
+	d.buf = grow(d.buf, rows*d.size)
 	return c.readFull(d.buf)
 }
 
@@ -117,11 +193,7 @@ func (d *fixedFloat) read(c *Conn, rows int) error {
 	if d.wide {
 		size = 8
 	}
-	n := rows * size
-	if cap(d.buf) < n {
-		d.buf = make([]byte, n)
-	}
-	d.buf = d.buf[:n]
+	d.buf = grow(d.buf, rows*size)
 	return c.readFull(d.buf)
 }
 
@@ -143,10 +215,7 @@ type strCol struct {
 
 func (d *strCol) read(c *Conn, rows int) error {
 	d.arena = d.arena[:0]
-	if cap(d.ends) < rows {
-		d.ends = make([]int, rows)
-	}
-	d.ends = d.ends[:rows]
+	d.ends = grow(d.ends, rows)
 	var err error
 	for i := range rows {
 		if d.arena, err = c.readStringInto(d.arena); err != nil {
@@ -175,11 +244,7 @@ type fixedStr struct {
 }
 
 func (d *fixedStr) read(c *Conn, rows int) error {
-	n := rows * d.n
-	if cap(d.buf) < n {
-		d.buf = make([]byte, n)
-	}
-	d.buf = d.buf[:n]
+	d.buf = grow(d.buf, rows*d.n)
 	return c.readFull(d.buf)
 }
 
@@ -195,11 +260,7 @@ type enumCol struct {
 }
 
 func (d *enumCol) read(c *Conn, rows int) error {
-	n := rows * d.size
-	if cap(d.buf) < n {
-		d.buf = make([]byte, n)
-	}
-	d.buf = d.buf[:n]
+	d.buf = grow(d.buf, rows*d.size)
 	return c.readFull(d.buf)
 }
 
@@ -224,14 +285,8 @@ type uuidCol struct {
 }
 
 func (d *uuidCol) read(c *Conn, rows int) error {
-	n := rows * 16
-	if cap(d.buf) < n {
-		d.buf = make([]byte, n)
-	}
-	d.buf = d.buf[:n]
-	if cap(d.txt) < 36 {
-		d.txt = make([]byte, 36)
-	}
+	d.buf = grow(d.buf, rows*16)
+	d.txt = grow(d.txt, 36)
 	return c.readFull(d.buf)
 }
 
@@ -260,21 +315,19 @@ func (d *uuidCol) BytesAt(i int) []byte {
 	return txt
 }
 
-// timeCol covers Date, Date32, DateTime, and DateTime64.
+// timeCol covers Date, Date32, DateTime, and DateTime64. dayBased columns
+// carry days since the epoch; the rest carry unit-nanosecond ticks.
 type timeCol struct {
 	base
-	size  int // wire width
-	unit  int64
-	epoch func(int64) time.Time
-	buf   []byte
+	size     int   // wire width
+	unit     int64 // nanoseconds per tick
+	dayBased bool
+	loc      *time.Location
+	buf      []byte
 }
 
 func (d *timeCol) read(c *Conn, rows int) error {
-	n := rows * d.size
-	if cap(d.buf) < n {
-		d.buf = make([]byte, n)
-	}
-	d.buf = d.buf[:n]
+	d.buf = grow(d.buf, rows*d.size)
 	return c.readFull(d.buf)
 }
 
@@ -290,7 +343,13 @@ func (d *timeCol) TimeAt(i int) time.Time {
 	default:
 		v = int64(binary.LittleEndian.Uint16(d.buf[i*2:]))
 	}
-	return d.epoch(v)
+	if d.dayBased {
+		if d.size == 4 {
+			v = int64(int32(v)) // Date32 is signed
+		}
+		return time.Unix(v*86400, 0).UTC()
+	}
+	return time.Unix(0, v*d.unit).In(d.loc)
 }
 
 // nullCol wraps any decoder with a null mask.
@@ -300,10 +359,7 @@ type nullCol struct {
 }
 
 func (d *nullCol) read(c *Conn, rows int) error {
-	if cap(d.mask) < rows {
-		d.mask = make([]byte, rows)
-	}
-	d.mask = d.mask[:rows]
+	d.mask = grow(d.mask, rows)
 	if err := c.readFull(d.mask); err != nil {
 		return err
 	}
@@ -351,13 +407,9 @@ func newDecoder(typ string, tz *time.Location) (Decoder, error) {
 	case "UUID":
 		return &uuidCol{}, nil
 	case "Date":
-		return &timeCol{size: 2, epoch: func(v int64) time.Time {
-			return time.Unix(v*86400, 0).UTC()
-		}}, nil
+		return &timeCol{size: 2, dayBased: true}, nil
 	case "Date32":
-		return &timeCol{size: 4, epoch: func(v int64) time.Time {
-			return time.Unix(int64(int32(v))*86400, 0).UTC()
-		}}, nil
+		return &timeCol{size: 4, dayBased: true}, nil
 	}
 	switch {
 	case strings.HasPrefix(typ, "Nullable(") && strings.HasSuffix(typ, ")"):
@@ -371,13 +423,7 @@ func newDecoder(typ string, tz *time.Location) (Decoder, error) {
 		if err != nil {
 			return nil, err
 		}
-		div := int64(1)
-		for i := precision; i < 9; i++ {
-			div *= 10
-		}
-		return &timeCol{size: 8, epoch: func(v int64) time.Time {
-			return time.Unix(0, v*div).In(loc)
-		}}, nil
+		return &timeCol{size: 8, unit: pow10Units(precision), loc: loc}, nil
 	case typ == "DateTime" || strings.HasPrefix(typ, "DateTime("):
 		loc := tz
 		if arg := typeArg(typ, "DateTime"); arg != "" {
@@ -385,13 +431,11 @@ func newDecoder(typ string, tz *time.Location) (Decoder, error) {
 				loc = l
 			}
 		}
-		return &timeCol{size: 4, epoch: func(v int64) time.Time {
-			return time.Unix(v, 0).In(loc)
-		}}, nil
+		return &timeCol{size: 4, unit: int64(time.Second), loc: loc}, nil
 	case strings.HasPrefix(typ, "FixedString("):
-		n, err := strconv.Atoi(typ[len("FixedString(") : len(typ)-1])
-		if err != nil || n <= 0 {
-			return nil, fmt.Errorf("chproto: bad type %q", typ)
+		n, err := parseFixedStringN(typ)
+		if err != nil {
+			return nil, err
 		}
 		return &fixedStr{n: n}, nil
 	case strings.HasPrefix(typ, "Enum8("):
@@ -478,13 +522,4 @@ func parseEnum(spec string) (map[int64][]byte, error) {
 		}
 	}
 	return names, nil
-}
-
-// discardColumn reads and drops one column payload (meta blocks).
-func discardColumn(c *Conn, typ string, rows int) error {
-	dec, err := newDecoder(typ, c.timezone)
-	if err != nil {
-		return err
-	}
-	return dec.read(c, rows)
 }

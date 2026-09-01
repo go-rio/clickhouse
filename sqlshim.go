@@ -97,20 +97,10 @@ func namedToAny(args []driver.NamedValue) []any {
 }
 
 type shimRows struct {
-	rows  *chproto.Rows
-	names []string
+	rows *chproto.Rows
 }
 
-func (r *shimRows) Columns() []string {
-	if r.names == nil {
-		cols := r.rows.Columns()
-		r.names = make([]string, len(cols))
-		for i, c := range cols {
-			r.names[i] = c.Name
-		}
-	}
-	return r.names
-}
+func (r *shimRows) Columns() []string { return r.rows.Names() }
 
 func (r *shimRows) Close() error { return r.rows.Close() }
 

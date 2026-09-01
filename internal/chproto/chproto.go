@@ -61,16 +61,13 @@ type Conn struct {
 	r    *bufio.Reader
 	w    *bufio.Writer
 
-	serverName string
-	major      uint64
-	minor      uint64
-	patch      uint64
-	revision   uint64 // negotiated: min(Revision, server)
-	timezone   *time.Location
+	timezone *time.Location
 
-	// scratch buffers reused across queries
-	varbuf [binary.MaxVarintLen64]byte
-	broken atomic.Bool // an I/O or protocol error poisons the connection
+	// scratch reused across queries
+	rows    *Rows
+	varbuf  [binary.MaxVarintLen64]byte
+	typeBuf []byte      // type-string scratch
+	broken  atomic.Bool // an I/O or protocol error poisons the connection
 }
 
 // Dial connects and completes the handshake.
@@ -100,11 +97,16 @@ func Dial(ctx context.Context, cfg Config) (*Conn, error) {
 	return c, nil
 }
 
+// applyDeadline arms the connection with ctx's deadline, or clears a stale
+// one left by an earlier call.
+func (c *Conn) applyDeadline(ctx context.Context) {
+	deadline, _ := ctx.Deadline()
+	c.netc.SetDeadline(deadline)
+}
+
 func (c *Conn) handshake(ctx context.Context, cfg Config) error {
-	if deadline, ok := ctx.Deadline(); ok {
-		c.netc.SetDeadline(deadline)
-		defer c.netc.SetDeadline(time.Time{})
-	}
+	c.applyDeadline(ctx)
+	defer c.netc.SetDeadline(time.Time{})
 	c.writeUvarint(clientHello)
 	c.writeString("go-rio/clickhouse")
 	c.writeUvarint(0)
@@ -128,23 +130,25 @@ func (c *Conn) handshake(ctx context.Context, cfg Config) error {
 	default:
 		return fmt.Errorf("chproto: handshake: unexpected packet %d", pt)
 	}
-	if c.serverName, err = c.readString(); err != nil {
+	name, err := c.readString()
+	if err != nil {
 		return err
 	}
-	if c.major, err = c.readUvarint(); err != nil {
+	major, err := c.readUvarint()
+	if err != nil {
 		return err
 	}
-	if c.minor, err = c.readUvarint(); err != nil {
+	minor, err := c.readUvarint()
+	if err != nil {
 		return err
 	}
 	srvRev, err := c.readUvarint()
 	if err != nil {
 		return err
 	}
-	c.revision = min(srvRev, Revision)
-	if c.revision < Revision {
+	if srvRev < Revision {
 		return fmt.Errorf("chproto: server %s %d.%d speaks revision %d; rio requires ClickHouse 26+ (revision %d)",
-			c.serverName, c.major, c.minor, srvRev, Revision)
+			name, major, minor, srvRev, Revision)
 	}
 	tz, err := c.readString() // >= 54058, guaranteed by the floor
 	if err != nil {
@@ -153,47 +157,31 @@ func (c *Conn) handshake(ctx context.Context, cfg Config) error {
 	if c.timezone, err = time.LoadLocation(tz); err != nil {
 		c.timezone = time.UTC
 	}
-	if _, err := c.readString(); err != nil { // display name, >= 54372
+	if err := c.skipString(); err != nil { // display name, >= 54372
 		return err
 	}
-	if c.patch, err = c.readUvarint(); err != nil { // >= 54401
+	if _, err := c.readUvarint(); err != nil { // version patch, >= 54401
 		return err
 	}
 	c.writeString("") // addendum: quota key, >= 54458
 	return c.flush()
 }
 
-// ServerVersion reports the negotiated server identity.
-func (c *Conn) ServerVersion() string {
-	return fmt.Sprintf("%s %d.%d.%d", c.serverName, c.major, c.minor, c.patch)
-}
-
 // Ping round-trips a protocol ping.
 func (c *Conn) Ping(ctx context.Context) error {
-	if deadline, ok := ctx.Deadline(); ok {
-		c.netc.SetDeadline(deadline)
-		defer c.netc.SetDeadline(time.Time{})
-	}
+	c.applyDeadline(ctx)
 	c.writeUvarint(clientPing)
 	if err := c.flush(); err != nil {
 		return c.fail(err)
 	}
-	for {
-		pt, err := c.readUvarint()
-		if err != nil {
-			return c.fail(err)
-		}
-		switch pt {
-		case serverPong:
-			return nil
-		case serverProgress:
-			if err := c.skipProgress(); err != nil {
-				return c.fail(err)
-			}
-		default:
-			return c.fail(fmt.Errorf("chproto: ping: unexpected packet %d", pt))
-		}
+	pt, err := c.nextPacket()
+	if err != nil {
+		return err
 	}
+	if pt != serverPong {
+		return c.fail(fmt.Errorf("chproto: ping: unexpected packet %d", pt))
+	}
+	return nil
 }
 
 // Close tears the connection down.

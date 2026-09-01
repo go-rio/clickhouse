@@ -10,6 +10,7 @@ package clickhouse
 import (
 	"context"
 	"crypto/tls"
+	"database/sql"
 	"fmt"
 	"net"
 	"net/url"
@@ -41,11 +42,7 @@ func Open(ctx context.Context, dsn string, opts ...rio.Option) (*rio.DB, error) 
 		pool.Close()
 		return nil, fmt.Errorf("clickhouse: open: %w", err)
 	}
-	view, err := OpenSQL(dsn)
-	if err != nil {
-		pool.Close()
-		return nil, err
-	}
+	view := sql.OpenDB(shimConnector{cfg: cfg})
 	nd := &nativeDB{pool: pool}
 	return rio.NewNative(rio.NativeConfig{DB: nd, Handle: pool, SQLView: view}, rio.ClickHouse, opts...), nil
 }
@@ -77,7 +74,7 @@ func parseDSN(dsn string) (chproto.Config, int, error) {
 	if _, _, err := net.SplitHostPort(u.Host); err != nil {
 		cfg.Addr = net.JoinHostPort(u.Host, "9000")
 	}
-	maxOpen := 0
+	var maxOpen int
 	var secure, skipVerify bool
 	for key, vals := range u.Query() {
 		val := vals[len(vals)-1]
@@ -90,9 +87,9 @@ func parseDSN(dsn string) (chproto.Config, int, error) {
 		case "database":
 			cfg.Database = val
 		case "secure":
-			secure, err = parseDSNBool(val)
+			secure, err = strconv.ParseBool(val)
 		case "skip_verify":
-			skipVerify, err = parseDSNBool(val)
+			skipVerify, err = strconv.ParseBool(val)
 		case "dial_timeout":
 			cfg.Timeout, err = time.ParseDuration(val)
 		case "max_open_conns":
@@ -110,14 +107,4 @@ func parseDSN(dsn string) (chproto.Config, int, error) {
 		cfg.TLS = &tls.Config{ServerName: host, InsecureSkipVerify: skipVerify}
 	}
 	return cfg, maxOpen, nil
-}
-
-func parseDSNBool(v string) (bool, error) {
-	switch v {
-	case "true", "1":
-		return true, nil
-	case "false", "0":
-		return false, nil
-	}
-	return false, fmt.Errorf("want true or false")
 }

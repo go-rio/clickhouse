@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"math"
 	"reflect"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -36,18 +35,14 @@ type Insert struct {
 // BeginInsert sends "INSERT INTO ... VALUES" (no inline data) and consumes
 // the response up to the server's schema sample block.
 func (c *Conn) BeginInsert(ctx context.Context, query string) (*Insert, error) {
-	if deadline, ok := ctx.Deadline(); ok {
-		c.netc.SetDeadline(deadline)
-	} else {
-		c.netc.SetDeadline(time.Time{})
-	}
+	c.applyDeadline(ctx)
 	if err := c.sendQuery(query); err != nil {
 		return nil, c.fail(err)
 	}
 	for {
-		pt, err := c.readUvarint()
+		pt, err := c.nextPacket()
 		if err != nil {
-			return nil, c.fail(err)
+			return nil, err
 		}
 		switch pt {
 		case serverData: // schema sample
@@ -70,21 +65,6 @@ func (c *Conn) BeginInsert(ctx context.Context, query string) (*Insert, error) {
 			return in, nil
 		case serverException:
 			return nil, c.readException()
-		case serverProgress:
-			if err := c.skipProgress(); err != nil {
-				return nil, c.fail(err)
-			}
-		case serverLog, serverProfileEvents:
-			if err := c.skipMetaBlock(); err != nil {
-				return nil, c.fail(err)
-			}
-		case serverTableColumns:
-			if err := c.skipString(); err != nil {
-				return nil, c.fail(err)
-			}
-			if err := c.skipString(); err != nil {
-				return nil, c.fail(err)
-			}
 		default:
 			return nil, c.fail(fmt.Errorf("chproto: insert: unexpected packet %d", pt))
 		}
@@ -96,9 +76,9 @@ func (c *Conn) BeginInsert(ctx context.Context, query string) (*Insert, error) {
 func (in *Insert) readLoop() {
 	c := in.conn
 	for {
-		pt, err := c.readUvarint()
+		pt, err := c.nextPacket()
 		if err != nil {
-			in.readDone <- c.fail(err)
+			in.readDone <- err
 			return
 		}
 		switch pt {
@@ -113,24 +93,26 @@ func (in *Insert) readLoop() {
 			c.netc.SetWriteDeadline(time.Unix(1, 0))
 			in.readDone <- err
 			return
-		case serverProgress:
-			err = c.skipProgress()
-		case serverProfileInfo:
-			err = c.skipProfileInfo()
-		case serverData, serverLog, serverProfileEvents:
-			err = c.skipMetaBlock()
-		case serverTableColumns:
-			if err = c.skipString(); err == nil {
-				err = c.skipString()
+		case serverData: // a stray sample echo carries no rows
+			if err := c.skipMetaBlock(); err != nil {
+				in.readDone <- err
+				return
 			}
 		default:
-			err = fmt.Errorf("chproto: insert: unexpected packet %d", pt)
-		}
-		if err != nil {
-			in.readDone <- c.fail(err)
+			in.readDone <- c.fail(fmt.Errorf("chproto: insert: unexpected packet %d", pt))
 			return
 		}
 	}
+}
+
+// Abort abandons a streaming insert after a caller-side failure: the
+// connection cannot be reused mid-stream, so it is poisoned, the reader
+// unblocked, and drained.
+func (in *Insert) Abort() {
+	c := in.conn
+	c.broken.Store(true)
+	c.netc.SetDeadline(time.Unix(1, 0))
+	<-in.readDone
 }
 
 // abortErr reports the reader's verdict when the writer hit err mid-stream:
@@ -163,13 +145,14 @@ func (in *Insert) Append(vals []any) error {
 	}
 	in.rows++
 	if in.rows >= flushRows {
-		if err := in.flush(); err != nil {
-			return in.abortErr(err)
-		}
+		return in.flush()
 	}
 	return nil
 }
 
+// flush writes the buffered block; a write failure reports the reader's
+// verdict when one exists (the server's exception explains the broken pipe
+// it caused).
 func (in *Insert) flush() error {
 	c := in.conn
 	c.writeUvarint(clientData)
@@ -183,7 +166,10 @@ func (in *Insert) flush() error {
 		enc.reset()
 	}
 	in.rows = 0
-	return c.flush()
+	if err := c.flush(); err != nil {
+		return in.abortErr(c.fail(err))
+	}
+	return nil
 }
 
 // Commit sends buffered rows and the end-of-data block, then waits for the
@@ -192,7 +178,7 @@ func (in *Insert) Commit() error {
 	c := in.conn
 	if in.rows > 0 {
 		if err := in.flush(); err != nil {
-			return in.abortErr(c.fail(err))
+			return err
 		}
 	}
 	c.writeEmptyBlock()
@@ -211,6 +197,18 @@ type encoder interface {
 	writeTo(c *Conn)
 	reset()
 }
+
+// bufEnc owns the byte buffer every fixed-payload encoder shares.
+type bufEnc struct {
+	buf []byte
+}
+
+func (e *bufEnc) writeTo(c *Conn) { c.w.Write(e.buf) }
+func (e *bufEnc) reset()          { e.buf = e.buf[:0] }
+
+var zeros [16]byte
+
+func (e *bufEnc) pad(n int) { e.buf = append(e.buf, zeros[:n]...) }
 
 func newEncoder(typ string) (encoder, error) {
 	switch typ {
@@ -231,7 +229,7 @@ func newEncoder(typ string) (encoder, error) {
 	case "Int64":
 		return &intEnc{size: 8}, nil
 	case "Bool":
-		return &intEnc{size: 1, boolish: true}, nil
+		return &intEnc{size: 1}, nil
 	case "Float32":
 		return &floatEnc{}, nil
 	case "Float64":
@@ -241,13 +239,9 @@ func newEncoder(typ string) (encoder, error) {
 	case "UUID":
 		return &uuidEnc{}, nil
 	case "Date":
-		return &timeEnc{size: 2, conv: func(t time.Time) int64 {
-			return t.Unix() / 86400
-		}}, nil
+		return &timeEnc{size: 2, dayBased: true}, nil
 	case "Date32":
-		return &timeEnc{size: 4, conv: func(t time.Time) int64 {
-			return t.Unix() / 86400
-		}}, nil
+		return &timeEnc{size: 4, dayBased: true}, nil
 	}
 	switch {
 	case strings.HasPrefix(typ, "Nullable(") && strings.HasSuffix(typ, ")"):
@@ -261,21 +255,13 @@ func newEncoder(typ string) (encoder, error) {
 		if err != nil {
 			return nil, err
 		}
-		mul := int64(1)
-		for i := precision; i < 9; i++ {
-			mul *= 10
-		}
-		return &timeEnc{size: 8, conv: func(t time.Time) int64 {
-			return t.UnixNano() / mul
-		}}, nil
+		return &timeEnc{size: 8, unit: pow10Units(precision)}, nil
 	case typ == "DateTime" || strings.HasPrefix(typ, "DateTime("):
-		return &timeEnc{size: 4, conv: func(t time.Time) int64 {
-			return t.Unix()
-		}}, nil
+		return &timeEnc{size: 4, unit: int64(time.Second)}, nil
 	case strings.HasPrefix(typ, "FixedString("):
-		n, err := strconv.Atoi(typ[len("FixedString(") : len(typ)-1])
-		if err != nil || n <= 0 {
-			return nil, fmt.Errorf("chproto: bad type %q", typ)
+		n, err := parseFixedStringN(typ)
+		if err != nil {
+			return nil, err
 		}
 		return &fixedStrEnc{n: n}, nil
 	case strings.HasPrefix(typ, "Enum8("):
@@ -329,22 +315,11 @@ func asInt64(v any) (int64, bool) {
 }
 
 type intEnc struct {
-	size    int
-	boolish bool
-	buf     []byte
+	bufEnc
+	size int
 }
 
 func (e *intEnc) append(v any) error {
-	if e.boolish {
-		if b, ok := v.(bool); ok {
-			if b {
-				e.buf = append(e.buf, 1)
-			} else {
-				e.buf = append(e.buf, 0)
-			}
-			return nil
-		}
-	}
 	n, ok := asInt64(v)
 	if !ok {
 		if b, ok := v.(bool); ok { // Bool column bound as 0/1 or true/false
@@ -369,17 +344,11 @@ func (e *intEnc) append(v any) error {
 	return nil
 }
 
-func (e *intEnc) appendZero() {
-	var zero [8]byte
-	e.buf = append(e.buf, zero[:e.size]...)
-}
-
-func (e *intEnc) writeTo(c *Conn) { c.w.Write(e.buf) }
-func (e *intEnc) reset()          { e.buf = e.buf[:0] }
+func (e *intEnc) appendZero() { e.pad(e.size) }
 
 type floatEnc struct {
+	bufEnc
 	wide bool
-	buf  []byte
 }
 
 func (e *floatEnc) append(v any) error {
@@ -410,16 +379,12 @@ func (e *floatEnc) append(v any) error {
 }
 
 func (e *floatEnc) appendZero() {
-	size := 4
 	if e.wide {
-		size = 8
+		e.pad(8)
+	} else {
+		e.pad(4)
 	}
-	var zero [8]byte
-	e.buf = append(e.buf, zero[:size]...)
 }
-
-func (e *floatEnc) writeTo(c *Conn) { c.w.Write(e.buf) }
-func (e *floatEnc) reset()          { e.buf = e.buf[:0] }
 
 func asString(v any) (string, bool) {
 	switch s := v.(type) {
@@ -434,9 +399,10 @@ func asString(v any) (string, bool) {
 	return "", false
 }
 
+// strEnc stores values wire-ready — varint length then bytes — so writeTo is
+// one bulk write.
 type strEnc struct {
-	arena []byte
-	ends  []int
+	bufEnc
 }
 
 func (e *strEnc) append(v any) error {
@@ -444,26 +410,16 @@ func (e *strEnc) append(v any) error {
 	if !ok {
 		return fmt.Errorf("cannot bind %T as a string", v)
 	}
-	e.arena = append(e.arena, s...)
-	e.ends = append(e.ends, len(e.arena))
+	e.buf = binary.AppendUvarint(e.buf, uint64(len(s)))
+	e.buf = append(e.buf, s...)
 	return nil
 }
 
-func (e *strEnc) appendZero() { e.ends = append(e.ends, len(e.arena)) }
-
-func (e *strEnc) writeTo(c *Conn) {
-	start := 0
-	for _, end := range e.ends {
-		c.writeBytes(e.arena[start:end])
-		start = end
-	}
-}
-
-func (e *strEnc) reset() { e.arena, e.ends = e.arena[:0], e.ends[:0] }
+func (e *strEnc) appendZero() { e.buf = append(e.buf, 0) }
 
 type fixedStrEnc struct {
-	n   int
-	buf []byte
+	bufEnc
+	n int
 }
 
 func (e *fixedStrEnc) append(v any) error {
@@ -482,18 +438,15 @@ func (e *fixedStrEnc) append(v any) error {
 }
 
 func (e *fixedStrEnc) appendZero() {
-	for range e.n {
-		e.buf = append(e.buf, 0)
+	for n := e.n; n > 0; n -= len(zeros) {
+		e.buf = append(e.buf, zeros[:min(n, len(zeros))]...)
 	}
 }
 
-func (e *fixedStrEnc) writeTo(c *Conn) { c.w.Write(e.buf) }
-func (e *fixedStrEnc) reset()          { e.buf = e.buf[:0] }
-
 type enumEnc struct {
+	bufEnc
 	size int
 	vals map[string]int64
-	buf  []byte
 }
 
 func enumValues(spec string) (map[string]int64, error) {
@@ -528,16 +481,10 @@ func (e *enumEnc) append(v any) error {
 	return nil
 }
 
-func (e *enumEnc) appendZero() {
-	var zero [2]byte
-	e.buf = append(e.buf, zero[:e.size]...)
-}
-
-func (e *enumEnc) writeTo(c *Conn) { c.w.Write(e.buf) }
-func (e *enumEnc) reset()          { e.buf = e.buf[:0] }
+func (e *enumEnc) appendZero() { e.pad(e.size) }
 
 type uuidEnc struct {
-	buf []byte
+	bufEnc
 }
 
 func (e *uuidEnc) append(v any) error {
@@ -583,28 +530,36 @@ func unhex(c byte) (byte, bool) {
 	return 0, false
 }
 
-func (e *uuidEnc) appendZero() {
-	var zero [16]byte
-	e.buf = append(e.buf, zero[:]...)
-}
+func (e *uuidEnc) appendZero() { e.pad(16) }
 
-func (e *uuidEnc) writeTo(c *Conn) { c.w.Write(e.buf) }
-func (e *uuidEnc) reset()          { e.buf = e.buf[:0] }
-
-// timeEnc accepts time.Time values; the adapter layer normalizes rio's text
-// form before it reaches the encoder.
+// timeEnc accepts time.Time values and rio's fixed-width time text — the
+// form the dialect binds — parsed without a layout interpreter.
 type timeEnc struct {
-	size int
-	conv func(time.Time) int64
-	buf  []byte
+	bufEnc
+	size     int
+	unit     int64 // nanoseconds per tick
+	dayBased bool
 }
 
 func (e *timeEnc) append(v any) error {
-	t, ok := v.(time.Time)
-	if !ok {
+	var t time.Time
+	switch x := v.(type) {
+	case time.Time:
+		t = x
+	case string:
+		var ok bool
+		if t, ok = parseTimeText(x); !ok {
+			return fmt.Errorf("cannot bind %q as a time", x)
+		}
+	default:
 		return fmt.Errorf("cannot bind %T as a time", v)
 	}
-	n := e.conv(t)
+	var n int64
+	if e.dayBased {
+		n = t.Unix() / 86400
+	} else {
+		n = t.UnixNano() / e.unit
+	}
 	switch e.size {
 	case 8:
 		e.buf = binary.LittleEndian.AppendUint64(e.buf, uint64(n))
@@ -616,13 +571,48 @@ func (e *timeEnc) append(v any) error {
 	return nil
 }
 
-func (e *timeEnc) appendZero() {
-	var zero [8]byte
-	e.buf = append(e.buf, zero[:e.size]...)
-}
+func (e *timeEnc) appendZero() { e.pad(e.size) }
 
-func (e *timeEnc) writeTo(c *Conn) { c.w.Write(e.buf) }
-func (e *timeEnc) reset()          { e.buf = e.buf[:0] }
+// parseTimeText decodes TimeFormat-shaped text ("2006-01-02
+// 15:04:05.000000-07:00") positionally.
+func parseTimeText(s string) (time.Time, bool) {
+	if len(s) != 32 || s[4] != '-' || s[7] != '-' || s[10] != ' ' ||
+		s[13] != ':' || s[16] != ':' || s[19] != '.' || s[29] != ':' ||
+		(s[26] != '+' && s[26] != '-') {
+		return time.Time{}, false
+	}
+	num := func(from, to int) (n int, ok bool) {
+		for i := from; i < to; i++ {
+			d := s[i] - '0'
+			if d > 9 {
+				return 0, false
+			}
+			n = n*10 + int(d)
+		}
+		return n, true
+	}
+	year, ok1 := num(0, 4)
+	month, ok2 := num(5, 7)
+	day, ok3 := num(8, 10)
+	hour, ok4 := num(11, 13)
+	minute, ok5 := num(14, 16)
+	sec, ok6 := num(17, 19)
+	micro, ok7 := num(20, 26)
+	offH, ok8 := num(27, 29)
+	offM, ok9 := num(30, 32)
+	if !(ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9) {
+		return time.Time{}, false
+	}
+	loc := time.UTC
+	if offH|offM != 0 {
+		offset := (offH*60 + offM) * 60
+		if s[26] == '-' {
+			offset = -offset
+		}
+		loc = time.FixedZone("", offset)
+	}
+	return time.Date(year, time.Month(month), day, hour, minute, sec, micro*1000, loc), true
+}
 
 type nullEnc struct {
 	inner encoder

@@ -3,7 +3,6 @@ package chproto
 import (
 	"context"
 	"fmt"
-	"time"
 )
 
 // Exception is a server-reported error.
@@ -128,6 +127,35 @@ func (c *Conn) skipProfileInfo() error {
 	return nil
 }
 
+// nextPacket reads server packets, consuming every mid-stream informational
+// one, and returns the first packet the caller must act on. Errors poison
+// the connection.
+func (c *Conn) nextPacket() (uint64, error) {
+	for {
+		pt, err := c.readUvarint()
+		if err != nil {
+			return 0, c.fail(err)
+		}
+		switch pt {
+		case serverProgress:
+			err = c.skipProgress()
+		case serverProfileInfo:
+			err = c.skipProfileInfo()
+		case serverTotals, serverExtremes, serverLog, serverProfileEvents:
+			err = c.skipMetaBlock()
+		case serverTableColumns:
+			if err = c.skipString(); err == nil {
+				err = c.skipString()
+			}
+		default:
+			return pt, nil
+		}
+		if err != nil {
+			return 0, c.fail(err)
+		}
+	}
+}
+
 // skipBlockInfo consumes the field-tagged BlockInfo prefix.
 func (c *Conn) skipBlockInfo() error {
 	for {
@@ -152,17 +180,65 @@ func (c *Conn) skipBlockInfo() error {
 	}
 }
 
-// skipMetaBlock consumes a Log/ProfileEvents/sample block without keeping it.
+// skipMetaBlock consumes a Log/ProfileEvents block allocation-free: fixed
+// widths discard through the buffered reader.
 func (c *Conn) skipMetaBlock() error {
 	if err := c.skipString(); err != nil { // table name
 		return err
 	}
-	_, err := c.readMetaColumns()
-	return err
+	if err := c.skipBlockInfo(); err != nil {
+		return err
+	}
+	cols, err := c.readUvarint()
+	if err != nil {
+		return err
+	}
+	rows, err := c.readUvarint()
+	if err != nil {
+		return err
+	}
+	for range cols {
+		if err := c.skipString(); err != nil { // name
+			return err
+		}
+		typ, err := c.readTypeScratch()
+		if err != nil {
+			return err
+		}
+		if _, err := c.readByte(); err != nil { // custom serialization flag
+			return err
+		}
+		if err := skipColumnData(c, typ, int(rows)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-// readMetaColumns parses a block's header and discards its column payloads,
-// returning the column descriptors (used for INSERT schema samples).
+// readColumnFlag consumes a column's custom-serialization flag byte.
+func (c *Conn) readColumnFlag(i int) error {
+	flag, err := c.readByte()
+	if err != nil {
+		return c.fail(err)
+	}
+	if flag != 0 {
+		return c.fail(fmt.Errorf("chproto: column %d uses custom serialization", i))
+	}
+	return nil
+}
+
+// readTypeScratch reads a type string into the connection's scratch buffer.
+func (c *Conn) readTypeScratch() (string, error) {
+	var err error
+	c.typeBuf, err = c.readStringInto(c.typeBuf[:0])
+	if err != nil {
+		return "", err
+	}
+	return string(c.typeBuf), nil
+}
+
+// readMetaColumns parses an INSERT schema sample's column descriptors; the
+// sample carries no rows.
 func (c *Conn) readMetaColumns() ([]Column, error) {
 	if err := c.skipBlockInfo(); err != nil {
 		return nil, err
@@ -171,8 +247,7 @@ func (c *Conn) readMetaColumns() ([]Column, error) {
 	if err != nil {
 		return nil, err
 	}
-	rows, err := c.readUvarint()
-	if err != nil {
+	if _, err := c.readUvarint(); err != nil { // rows: always zero
 		return nil, err
 	}
 	out := make([]Column, cols)
@@ -188,27 +263,24 @@ func (c *Conn) readMetaColumns() ([]Column, error) {
 		} else if flag != 0 {
 			return nil, fmt.Errorf("chproto: column %q uses custom serialization", out[i].Name)
 		}
-		if rows > 0 {
-			if err := discardColumn(c, out[i].Type, int(rows)); err != nil {
-				return nil, err
-			}
-		}
 	}
 	return out, nil
 }
 
 // Query executes a row-returning statement. The returned Rows must be fully
-// consumed (Next until false, or Close) before the connection is reused.
+// consumed (Next until false, or Close) before the connection is reused; it
+// is owned by the connection and recycled — with its decoders and buffers —
+// by the next Query.
 func (c *Conn) Query(ctx context.Context, query string) (*Rows, error) {
-	if deadline, ok := ctx.Deadline(); ok {
-		c.netc.SetDeadline(deadline)
-	} else {
-		c.netc.SetDeadline(time.Time{})
-	}
+	c.applyDeadline(ctx)
 	if err := c.sendQuery(query); err != nil {
 		return nil, c.fail(err)
 	}
-	rows := &Rows{conn: c}
+	if c.rows == nil {
+		c.rows = &Rows{conn: c}
+	}
+	rows := c.rows
+	rows.reset()
 	// prefetch until the first data block or terminal packet, so execution
 	// errors surface here rather than on the first Next.
 	if err := rows.pump(); err != nil {
