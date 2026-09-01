@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-09-02
+
+### Fixed
+
+- A negative `float64` bound into a `Decimal` column through `InsertAll` kept its sign; the encoder negated an already two's-complement value, so `-3.5` landed as `3.50`.
+- A nested server exception reports its outermost entry (the primary error) instead of the innermost cause.
+
+### Added
+
+- `CONTRIBUTING.md`, `CHANGELOG.md`, `llms.txt`, and compile-only examples for `Open` and `OpenSQL`.
+
+### Changed
+
+- README restructured; package comments name the entry points; source files follow one declaration order. No API change.
+
 ## [0.9.0] - 2026-09-02
 
 ### Changed
@@ -126,7 +141,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Eager DSN validation at `Open`.
 - No constraint-error translation: ClickHouse has no unique or foreign-key constraints, so rio's constraint sentinels never fire.
 
-[Unreleased]: https://github.com/go-rio/clickhouse/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/go-rio/clickhouse/compare/v0.9.1...HEAD
+[0.9.1]: https://github.com/go-rio/clickhouse/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/go-rio/clickhouse/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/go-rio/clickhouse/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/go-rio/clickhouse/compare/v0.6.0...v0.7.0
