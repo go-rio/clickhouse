@@ -569,18 +569,11 @@ func (e *decimalEnc) append(v any) error {
 			if math.Abs(scaled) >= 9.2e18 {
 				return fmt.Errorf("decimal value %v overflows the float64-bound path; bind it as a string", v)
 			}
+			// int64(scaled) is already the two's-complement magnitude; the
+			// sign extension fills hi.
 			n := int64(scaled)
 			lo = uint64(n)
 			hi = uint64(n >> 63)
-			neg = n < 0
-			if neg {
-				lo = ^lo + 1
-				hi = ^hi
-				if lo == 0 {
-					hi++
-				}
-				neg = false // already two's complement
-			}
 		} else if n, _, ok := asInt64(v); ok {
 			for range e.scale {
 				n *= 10

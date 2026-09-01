@@ -45,6 +45,20 @@ func TestDecimalFloatAndIntBindings(t *testing.T) {
 	}
 }
 
+// A negative float keeps its sign on every width.
+func TestDecimalNegativeFloat(t *testing.T) {
+	for _, size := range []int{4, 8, 16} {
+		enc := &decimalEnc{size: size, scale: 2}
+		if err := enc.append(-3.5); err != nil {
+			t.Fatal(err)
+		}
+		dec := &decimalCol{size: size, scale: 2, buf: enc.buf}
+		if got := string(dec.BytesAt(0)); got != "-3.50" {
+			t.Fatalf("size %d: got %s, want -3.50", size, got)
+		}
+	}
+}
+
 func TestDecimalRejects(t *testing.T) {
 	enc := &decimalEnc{size: 8, scale: 2}
 	for _, bad := range []string{"", "-", "1.234", "12a", "."} {

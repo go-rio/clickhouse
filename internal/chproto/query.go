@@ -125,8 +125,7 @@ func (c *Conn) writeBlockHeader(cols, rows int) {
 // exception of a nested chain.
 func (c *Conn) readException() error {
 	first := &Exception{}
-	cur := first
-	for {
+	for depth := 0; ; depth++ {
 		code, err := c.readInt32()
 		if err != nil {
 			return c.fail(err)
@@ -146,7 +145,9 @@ func (c *Conn) readException() error {
 		if err != nil {
 			return c.fail(err)
 		}
-		cur.Code, cur.Name, cur.Message = code, name, msg
+		if depth == 0 {
+			first.Code, first.Name, first.Message = code, name, msg
+		}
 		if nested == 0 {
 			return first
 		}
