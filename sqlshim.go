@@ -10,10 +10,9 @@ import (
 	"github.com/go-rio/clickhouse/internal/chproto"
 )
 
-// OpenSQL opens a plain database/sql handle over the native protocol — the
-// surface go-rio/migrate consumes. Placeholders are ? and interpolate
-// client-side; there are no transactions or prepared statements, and
-// affected-row counts are always zero, matching ClickHouse itself.
+// OpenSQL opens a plain database/sql handle over the native protocol.
+// Placeholders are ? and interpolate client-side; there are no transactions
+// or prepared statements, and affected-row counts are always zero.
 func OpenSQL(dsn string) (*sql.DB, error) {
 	cfg, _, err := parseDSN(dsn)
 	if err != nil {
@@ -59,7 +58,7 @@ func (c *shimConn) Begin() (driver.Tx, error) {
 
 func (c *shimConn) Ping(ctx context.Context) error { return c.conn.Ping(ctx) }
 
-// IsValid reports connection health so database/sql discards poisoned ones.
+// IsValid lets database/sql discard poisoned connections.
 func (c *shimConn) IsValid() bool { return !c.conn.Broken() }
 
 func (c *shimConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
@@ -85,8 +84,8 @@ func (c *shimConn) QueryContext(ctx context.Context, query string, args []driver
 	return &shimRows{rows: rows}, nil
 }
 
-// badConnOr maps transmission failures to ErrBadConn so database/sql retries
-// them on a fresh connection — the query never reached the server.
+// badConnOr maps SendError to ErrBadConn so database/sql retries it on a
+// fresh connection.
 func badConnOr(err error) error {
 	var send *chproto.SendError
 	if errors.As(err, &send) {
@@ -141,7 +140,7 @@ func (r *shimRows) Next(dest []driver.Value) error {
 		case chproto.KindTime:
 			dest[i] = dec.TimeAt(row)
 		default:
-			dest[i] = string(dec.BytesAt(row)) // owned copy
+			dest[i] = string(dec.BytesAt(row))
 		}
 	}
 	return nil

@@ -34,8 +34,8 @@ func TestPoolExpiresIdle(t *testing.T) {
 		server.Read(b[:]) // EOF once the pool closes the expired conn
 		close(closed)
 	}()
-	// The idle conn is expired, so Acquire falls through to Dial, which
-	// fails against the empty address — proving nothing stale was served.
+	// Acquire must fall through to Dial (which fails on the empty address)
+	// rather than serve the expired conn.
 	if _, err := p.Acquire(context.Background()); err == nil {
 		t.Fatal("expired idle conn must not be served")
 	}
@@ -58,7 +58,7 @@ func TestPoolReusesFreshIdle(t *testing.T) {
 	}
 }
 
-// A transmission failure surfaces as SendError — the retry-safe class.
+// A transmission failure surfaces as SendError.
 func TestQuerySendFailureIsSendError(t *testing.T) {
 	c, server := pipeConn()
 	server.Close()

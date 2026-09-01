@@ -90,7 +90,6 @@ func TestNativeRoundTrip(t *testing.T) {
 	}
 }
 
-// CreatedAt gives the test access without exporting fixture internals.
 func (e Event) CreatedAt() time.Time { return e.At }
 
 func TestInsertAllStreamsBlocks(t *testing.T) {
@@ -250,9 +249,8 @@ type ExtType struct {
 	Peak   int64  // SimpleAggregateFunction(max, Int64)
 }
 
-// Every type the old channel served must round-trip on the native one:
-// decimals, 128-bit integers, IP addresses, low-cardinality strings, and
-// simple aggregate wrappers.
+// Decimals, 128-bit integers, IPs, LowCardinality strings, and simple
+// aggregate wrappers must round-trip on both insert paths.
 func TestExtendedTypesRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	db := openTest(t)

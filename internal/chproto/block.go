@@ -8,10 +8,8 @@ type Column struct {
 	Type string
 }
 
-// Rows streams a query's result blocks. Column decoders and their buffers
-// build on the first block and are reused for every following one — and,
-// when the next query returns the same column shape, across queries; value
-// accessors return borrowed data valid only until the next Next call.
+// Rows streams a query's result blocks, reusing decoders across blocks and
+// queries. Accessors return borrowed data valid only until the next Next.
 type Rows struct {
 	conn  *Conn
 	cols  []Column
@@ -70,9 +68,8 @@ func (r *Rows) Next() bool {
 	return true
 }
 
-// pump reads packets until a non-empty data block, end of stream, or error.
-// On return either rows > 0 with idx before the first row, or the stream is
-// finished.
+// pump reads packets until a non-empty data block, end of stream, or error;
+// on return either rows > 0 with idx reset, or the stream is finished.
 func (r *Rows) pump() error {
 	c := r.conn
 	r.rows, r.idx = 0, -1
@@ -130,10 +127,8 @@ func (r *Rows) readBlock() (int, error) {
 	}
 
 	if !r.blockSeen {
-		// The query's first block establishes the shape. Decoders left by an
-		// earlier query on this Rows are reused column-for-column when the
-		// type matches — their buffers are already sized — and rebuilt
-		// otherwise.
+		// The first block establishes the shape; decoders from an earlier
+		// query are reused per column when the type matches.
 		r.blockSeen = true
 		if ncols != len(r.cols) {
 			r.names = nil
@@ -175,8 +170,7 @@ func (r *Rows) readBlock() (int, error) {
 		r.cols, r.decs = cols, decs
 		return nrows, nil
 	}
-	// Later blocks of the same result must keep the shape; verify against
-	// scratch without allocating.
+	// Later blocks must keep the first block's shape.
 	if ncols != len(r.cols) {
 		return 0, c.fail(fmt.Errorf("chproto: block column count changed: %d != %d", ncols, len(r.cols)))
 	}

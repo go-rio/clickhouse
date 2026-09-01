@@ -13,8 +13,8 @@ native TCP protocol directly.
   in-repo; `go.mod` requires only `go-rio/rio`.
 - **Fast** — column blocks decode straight into rio's typed sinks and
   `InsertAll` streams native column blocks: ~2× faster reads and ~3.7×
-  faster bulk inserts than the previous `clickhouse-go` channel, at one
-  allocation per row read.
+  faster bulk inserts than going through `clickhouse-go`, at one allocation
+  per row read.
 - **ClickHouse 26+**, protocol revision 54460, uncompressed.
 
 ## Getting started
@@ -65,8 +65,7 @@ Reads support the full builder, relations, and Raw. Writes are `Insert`,
 `InsertAll`, and `Exec`; rio rejects transactions, row locks, synchronous
 update/delete, conflict upserts, and statement caching at the dialect
 level. Generated values are never backfilled — supply IDs yourself
-(`rio:",noautoincr"`). Parameters bind client-side, as this channel always
-has.
+(`rio:",noautoincr"`). Parameters bind client-side.
 
 Server errors are `*clickhouse.Exception` via `errors.As`. There is no
 constraint-error translator: ClickHouse has no unique or foreign key

@@ -5,9 +5,8 @@ import (
 	"fmt"
 )
 
-// SendError marks a failure while transmitting a query, before the server
-// can have acted on it — the one window where retrying on a fresh
-// connection is always safe.
+// SendError marks a transmission failure: the server never acted on the
+// query, so retrying on a fresh connection is safe.
 type SendError struct {
 	Err error
 }
@@ -26,9 +25,8 @@ func (e *Exception) Error() string {
 	return fmt.Sprintf("clickhouse: %s (code %d): %s", e.Name, e.Code, e.Message)
 }
 
-// sendQuery writes a Query packet followed by the empty external-data block.
-// settings rides each query; rio always sends the low-cardinality opt-out so
-// the server delivers plain columns.
+// sendQuery writes a Query packet and the empty external-data block. Every
+// query carries the LowCardinality opt-out, so those columns arrive plain.
 func (c *Conn) sendQuery(query string) error {
 	c.writeUvarint(clientQuery)
 	c.writeString("") // query id: server assigns
@@ -137,9 +135,8 @@ func (c *Conn) skipProfileInfo() error {
 	return nil
 }
 
-// nextPacket reads server packets, consuming every mid-stream informational
-// one, and returns the first packet the caller must act on. Errors poison
-// the connection.
+// nextPacket consumes mid-stream informational packets and returns the first
+// one the caller must act on. Errors poison the connection.
 func (c *Conn) nextPacket() (uint64, error) {
 	for {
 		pt, err := c.readUvarint()
@@ -190,8 +187,7 @@ func (c *Conn) skipBlockInfo() error {
 	}
 }
 
-// skipMetaBlock consumes a Log/ProfileEvents block allocation-free: fixed
-// widths discard through the buffered reader.
+// skipMetaBlock consumes a Log/ProfileEvents block without decoding it.
 func (c *Conn) skipMetaBlock() error {
 	if err := c.skipString(); err != nil { // table name
 		return err
@@ -277,10 +273,8 @@ func (c *Conn) readMetaColumns() ([]Column, error) {
 	return out, nil
 }
 
-// Query executes a row-returning statement. The returned Rows must be fully
-// consumed (Next until false, or Close) before the connection is reused; it
-// is owned by the connection and recycled — with its decoders and buffers —
-// by the next Query.
+// Query executes a row-returning statement. The connection owns the returned
+// Rows and recycles it on the next Query; drain or Close it first.
 func (c *Conn) Query(ctx context.Context, query string) (*Rows, error) {
 	c.applyDeadline(ctx)
 	if err := c.sendQuery(query); err != nil {
@@ -291,8 +285,7 @@ func (c *Conn) Query(ctx context.Context, query string) (*Rows, error) {
 	}
 	rows := c.rows
 	rows.reset()
-	// prefetch until the first data block or terminal packet, so execution
-	// errors surface here rather than on the first Next.
+	// prefetch so execution errors surface here, not at the first Next
 	if err := rows.pump(); err != nil {
 		return nil, err
 	}

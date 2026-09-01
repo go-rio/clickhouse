@@ -1,8 +1,7 @@
-// Package chproto speaks the ClickHouse native TCP protocol directly: no
-// driver, no third-party dependencies, no compression. The client pins
-// protocol revision 54460 — the server negotiates down to it, which freezes
-// every frame layout this package implements (no chunked framing, nonces, or
-// password-complexity exchanges).
+// Package chproto speaks the ClickHouse native TCP protocol directly, with
+// no third-party dependencies and no compression. The client pins protocol
+// revision 54460; the server negotiates down to it, freezing every frame
+// layout implemented here.
 package chproto
 
 import (
@@ -54,8 +53,7 @@ type Config struct {
 	Timeout  time.Duration
 }
 
-// Conn is one native-protocol connection. Not safe for concurrent use; the
-// pool serializes access.
+// Conn is one native-protocol connection; not safe for concurrent use.
 type Conn struct {
 	netc net.Conn
 	r    *bufio.Reader
@@ -97,8 +95,7 @@ func Dial(ctx context.Context, cfg Config) (*Conn, error) {
 	return c, nil
 }
 
-// applyDeadline arms the connection with ctx's deadline, or clears a stale
-// one left by an earlier call.
+// applyDeadline sets ctx's deadline on the connection, clearing a stale one.
 func (c *Conn) applyDeadline(ctx context.Context) {
 	deadline, _ := ctx.Deadline()
 	c.netc.SetDeadline(deadline)
@@ -215,7 +212,7 @@ func (c *Conn) readString() (string, error) {
 }
 
 // readStringInto appends the next string's bytes to dst, returning the
-// extended slice — the zero-garbage path for column payloads.
+// extended slice.
 func (c *Conn) readStringInto(dst []byte) ([]byte, error) {
 	n, err := c.readUvarint()
 	if err != nil {

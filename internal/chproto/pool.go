@@ -11,9 +11,7 @@ import (
 var ErrPoolClosed = errors.New("chproto: pool is closed")
 
 // Pool hands out connections one query at a time. Broken connections are
-// discarded on release, and idle ones expire after maxIdle — the server and
-// middleboxes close quiet connections, so an aged one is presumed dead (and
-// its grown column buffers are memory worth returning).
+// discarded on release; idle ones expire after maxIdle.
 type Pool struct {
 	cfg     Config
 	maxIdle time.Duration
@@ -29,8 +27,8 @@ type idleConn struct {
 	since time.Time
 }
 
-// NewPool creates a pool of at most maxOpen connections that dial lazily;
-// idle connections expire after maxIdle (default five minutes).
+// NewPool creates a pool of at most maxOpen connections that dial lazily.
+// maxOpen defaults to 8, maxIdle to five minutes.
 func NewPool(cfg Config, maxOpen int, maxIdle time.Duration) *Pool {
 	if maxOpen <= 0 {
 		maxOpen = 8
@@ -108,7 +106,7 @@ func (p *Pool) Close() error {
 	return nil
 }
 
-// Ping verifies connectivity by acquiring a connection and pinging it.
+// Ping verifies connectivity.
 func (p *Pool) Ping(ctx context.Context) error {
 	c, err := p.Acquire(ctx)
 	if err != nil {

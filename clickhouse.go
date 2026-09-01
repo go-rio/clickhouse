@@ -1,10 +1,9 @@
 // Package clickhouse connects rio to ClickHouse over its native TCP
 // protocol, implemented in-repo with no third-party dependencies.
 //
-// ClickHouse 26.7 or newer is required for rio's offset-carrying time
-// values. No constraint-error translator is installed (ClickHouse has no
-// unique or foreign key constraints); server errors remain reachable as
-// *clickhouse.Exception through errors.As.
+// ClickHouse 26.7 or newer is required. Server errors are reachable as
+// *clickhouse.Exception through errors.As; there is no constraint-error
+// translation.
 package clickhouse
 
 import (
@@ -31,8 +30,7 @@ type Exception = chproto.Exception
 // conn_max_idle_time.
 //
 // The returned DB's Unwrap serves a database/sql view over its own
-// connections (what go-rio/migrate consumes); rio itself executes on the
-// protocol directly.
+// connections.
 func Open(ctx context.Context, dsn string, opts ...rio.Option) (*rio.DB, error) {
 	cfg, po, err := parseDSN(dsn)
 	if err != nil {

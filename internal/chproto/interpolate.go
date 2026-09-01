@@ -16,9 +16,7 @@ const TimeFormat = "2006-01-02 15:04:05.000000+00:00"
 
 // Interpolate substitutes ? placeholders with SQL literals, honoring
 // ClickHouse quoting: '...' strings (with \ escapes), `...` and "..."
-// identifiers, -- and /* */ comments, and the \? literal-question escape the
-// rendered SQL may carry. rio's ClickHouse channel has always bound
-// client-side; this owns that duty without a driver.
+// identifiers, -- and /* */ comments, and the \? literal-question escape.
 func Interpolate(query string, args []any) (string, error) {
 	if len(args) == 0 && !strings.ContainsRune(query, '?') {
 		return query, nil
@@ -174,8 +172,6 @@ func appendLiteral(buf []byte, v any) ([]byte, error) {
 		}
 		return append(buf, "false"...), nil
 	case time.Time:
-		// rio binds times as text before they reach the channel; direct Raw
-		// arguments still deserve a correct literal.
 		return appendQuoted(buf, x.UTC().Format(TimeFormat)), nil
 	}
 	rv := reflect.ValueOf(v)

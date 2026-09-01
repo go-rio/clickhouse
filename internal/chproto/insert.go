@@ -15,16 +15,9 @@ import (
 // flushRows is the row threshold at which Append flushes a block.
 const flushRows = 65536
 
-// Insert streams native column blocks for one INSERT statement. The column
-// set and types come from the server's schema sample, so encoders never
-// guess. Append accumulates rows, Commit sends the trailing block and the
-// end-of-data marker.
-//
-// A background reader consumes the server's response while data streams. If
-// the server aborts mid-stream (a quota or parsing error), it stops reading
-// our data and reports an Exception; without the reader both sides would
-// deadlock — the server waiting for us to read, us blocked on a full send
-// buffer. The reader unblocks a stuck writer by expiring its deadline.
+// Insert streams native column blocks for one INSERT statement, typed by the
+// server's schema sample. A background reader must drain the server's
+// response while data streams, or a mid-stream abort blocks both sides.
 type Insert struct {
 	conn *Conn
 	cols []Column
@@ -89,8 +82,7 @@ func (in *Insert) readLoop() {
 			return
 		case serverException:
 			err := c.readException()
-			// Unblock a writer stuck on a full send buffer; the connection
-			// is done for either way once the server aborted the insert.
+			// unblock a writer stuck on a full send buffer
 			c.broken.Store(true)
 			c.netc.SetWriteDeadline(time.Unix(1, 0))
 			in.readDone <- err
@@ -107,9 +99,8 @@ func (in *Insert) readLoop() {
 	}
 }
 
-// Abort abandons a streaming insert after a caller-side failure: the
-// connection cannot be reused mid-stream, so it is poisoned, the reader
-// unblocked, and drained.
+// Abort abandons the insert and poisons the connection — it cannot be
+// reused mid-stream.
 func (in *Insert) Abort() {
 	c := in.conn
 	c.broken.Store(true)
@@ -117,9 +108,7 @@ func (in *Insert) Abort() {
 	<-in.readDone
 }
 
-// abortErr reports the reader's verdict when the writer hit err mid-stream:
-// a server Exception explains a write failure better than the broken pipe it
-// caused.
+// abortErr prefers the reader's error, when one arrives, over the writer's.
 func (in *Insert) abortErr(err error) error {
 	select {
 	case rerr := <-in.readDone:
@@ -152,9 +141,7 @@ func (in *Insert) Append(vals []any) error {
 	return nil
 }
 
-// flush writes the buffered block; a write failure reports the reader's
-// verdict when one exists (the server's exception explains the broken pipe
-// it caused).
+// flush writes the buffered block.
 func (in *Insert) flush() error {
 	c := in.conn
 	c.writeUvarint(clientData)
@@ -174,8 +161,8 @@ func (in *Insert) flush() error {
 	return nil
 }
 
-// Commit sends buffered rows and the end-of-data block, then waits for the
-// reader's verdict. ClickHouse reports no row count; callers track their own.
+// Commit sends buffered rows plus the end-of-data block and waits for the
+// reader's result. ClickHouse reports no row count.
 func (in *Insert) Commit() error {
 	c := in.conn
 	if in.rows > 0 {
@@ -405,8 +392,7 @@ func asString(v any) (string, bool) {
 	return "", false
 }
 
-// strEnc stores values wire-ready — varint length then bytes — so writeTo is
-// one bulk write.
+// strEnc stores values wire-ready: varint length then bytes.
 type strEnc struct {
 	bufEnc
 }
@@ -538,8 +524,7 @@ func unhex(c byte) (byte, bool) {
 
 func (e *uuidEnc) appendZero() { e.pad(16) }
 
-// timeEnc accepts time.Time values and rio's fixed-width time text — the
-// form the dialect binds — parsed without a layout interpreter.
+// timeEnc accepts time.Time values and TimeFormat-shaped text.
 type timeEnc struct {
 	bufEnc
 	size     int
@@ -579,8 +564,7 @@ func (e *timeEnc) append(v any) error {
 
 func (e *timeEnc) appendZero() { e.pad(e.size) }
 
-// parseTimeText decodes TimeFormat-shaped text ("2006-01-02
-// 15:04:05.000000-07:00") positionally.
+// parseTimeText decodes TimeFormat-shaped text positionally.
 func parseTimeText(s string) (time.Time, bool) {
 	if len(s) != 32 || s[4] != '-' || s[7] != '-' || s[10] != ' ' ||
 		s[13] != ':' || s[16] != ':' || s[19] != '.' || s[29] != ':' ||

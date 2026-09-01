@@ -16,9 +16,7 @@ type nativeDB struct {
 	pool *chproto.Pool
 }
 
-// acquire hands do a pooled connection, redialing once when transmission
-// itself failed — a stale idle connection the server closed surfaces there,
-// before the query can have run.
+// acquire runs do on a pooled connection, redialing once on SendError.
 func (d *nativeDB) acquire(ctx context.Context, do func(*chproto.Conn) error) (*chproto.Conn, error) {
 	for attempt := 0; ; attempt++ {
 		c, err := d.pool.Acquire(ctx)
@@ -64,8 +62,7 @@ func (d *nativeDB) Exec(ctx context.Context, sqlText string, args []any) (int64,
 		return 0, err
 	}
 	d.pool.Release(c)
-	// ClickHouse reports no affected-row counts; rio's dialect rejects every
-	// API whose contract needs one.
+	// ClickHouse reports no affected-row counts.
 	return 0, nil
 }
 
@@ -76,8 +73,7 @@ func (d *nativeDB) Begin(context.Context, *sql.TxOptions) (rio.NativeTx, error) 
 
 func (d *nativeDB) Close() error { return d.pool.Close() }
 
-// CopyIn implements rio.NativeCopier: InsertAll streams straight into native
-// column blocks. ClickHouse never backfills, so every batch takes this path.
+// CopyIn implements rio.NativeCopier by streaming native column blocks.
 func (d *nativeDB) CopyIn(ctx context.Context, table []string, columns []string, next func() ([]any, error)) (int64, error) {
 	var b strings.Builder
 	b.WriteString("INSERT INTO ")
@@ -105,7 +101,6 @@ func (d *nativeDB) CopyIn(ctx context.Context, table []string, columns []string,
 		return 0, err
 	}
 	defer d.pool.Release(c)
-	// An abandoned stream cannot leave a reusable connection behind.
 	committed := false
 	defer func() {
 		if !committed {
@@ -141,16 +136,15 @@ func quoteIdent(b *strings.Builder, name string) {
 	b.WriteByte('`')
 }
 
-// nativeRows adapts a protocol result stream to rio's NativeRows: typed
-// column decoders feed NativeCell sinks with no driver.Value detour. rio
-// passes the same dest slots every row, so classification happens once.
+// nativeRows adapts a protocol result stream to rio's NativeRows. rio passes
+// the same dest slots every row, so the scan plan is built once.
 type nativeRows struct {
 	pool     *chproto.Pool
 	conn     *chproto.Conn
 	rows     *chproto.Rows
 	plan     []scanStep
 	released bool
-	err      error // final verdict, cached before the connection re-enters the pool
+	err      error // cached by Close
 }
 
 // scanStep is one column's row-invariant scan strategy.
@@ -208,7 +202,7 @@ func (r *nativeRows) Scan(dest ...any) error {
 			if step.rawBytes {
 				err = cell.SetBytes(b) // SetBytes never retains its argument
 			} else {
-				err = cell.SetString(string(b)) // owned copy per the contract
+				err = cell.SetString(string(b))
 			}
 		}
 		if err != nil {
@@ -225,9 +219,8 @@ func (r *nativeRows) Err() error {
 	return r.rows.Err()
 }
 
-// Close drains the stream and returns the connection. rio reads Err after
-// Close, and the released connection's Rows may already serve another
-// query — so the verdict is cached first and rows never touched again.
+// Close drains the stream and releases the connection, caching the final
+// error first: rio reads Err after Close, when rows may be recycled.
 func (r *nativeRows) Close() {
 	if r.released {
 		return

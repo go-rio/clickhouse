@@ -145,8 +145,7 @@ func skipColumnData(c *Conn, typ string, rows int) error {
 	return nil
 }
 
-// Kind is the access class a decoder serves; the SPI layer picks the
-// matching typed sink once per column.
+// Kind is the access class a decoder serves.
 type Kind uint8
 
 const (
@@ -158,9 +157,8 @@ const (
 	KindTime
 )
 
-// decoder loads one column per block and serves typed per-row access.
-// Accessors must only be called with the row index of the current block, and
-// borrowed bytes die at the next read.
+// Decoder loads one column per block and serves typed per-row access; row
+// indexes address the current block, and borrowed bytes die at the next read.
 type Decoder interface {
 	read(c *Conn, rows int) error
 	Kind() Kind
@@ -408,8 +406,8 @@ func (d *timeCol) TimeAt(i int) time.Time {
 	return time.Unix(0, v*d.unit).In(d.loc)
 }
 
-// decimalCol decodes Decimal columns — scaled little-endian integers of 4,
-// 8, or 16 bytes — into fixed-scale decimal text.
+// decimalCol decodes Decimal columns (scaled little-endian integers) into
+// fixed-scale decimal text.
 type decimalCol struct {
 	base
 	size  int
@@ -448,7 +446,7 @@ func (d *decimalCol) BytesAt(i int) []byte {
 			hi++
 		}
 	}
-	// format the unsigned 128-bit value in reverse, then point at the front
+	// digits accumulate least-significant first; reversed at the end
 	d.txt = d.txt[:0]
 	digits := 0
 	for hi != 0 || lo != 0 || digits <= d.scale {
@@ -468,8 +466,7 @@ func (d *decimalCol) BytesAt(i int) []byte {
 	return d.txt
 }
 
-// int128Col decodes Int128/UInt128 into decimal text (Go has no native
-// 128-bit integer; string fields carry them exactly).
+// int128Col decodes Int128/UInt128 into decimal text.
 type int128Col struct {
 	base
 	signed bool
@@ -509,7 +506,7 @@ func (d *int128Col) BytesAt(i int) []byte {
 	return d.txt
 }
 
-// ipCol decodes IPv4 (wire UInt32) and IPv6 (16 raw bytes) into text.
+// ipCol decodes IPv4 (wire = LE UInt32) and IPv6 (16 raw bytes) into text.
 type ipCol struct {
 	base
 	v6  bool
@@ -540,8 +537,8 @@ func (d *ipCol) BytesAt(i int) []byte {
 	return d.txt
 }
 
-// nothingCol carries the value-free column of NULL literals; the wrapping
-// Nullable mask says everything, the payload is one placeholder byte a row.
+// nothingCol handles Nothing (NULL-literal) columns: one placeholder byte
+// per row.
 type nothingCol struct {
 	base
 	buf []byte
