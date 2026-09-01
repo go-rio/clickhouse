@@ -61,6 +61,7 @@ type Conn struct {
 	dialedAt time.Time
 
 	timezone *time.Location
+	ctx      context.Context // watched context of the operation in flight
 
 	// scratch reused across queries
 	rows    *Rows
@@ -97,14 +98,23 @@ func Dial(ctx context.Context, cfg Config) (*Conn, error) {
 	return c, nil
 }
 
-// applyDeadline sets ctx's deadline on the connection, clearing a stale one.
-func (c *Conn) applyDeadline(ctx context.Context) {
+// watch arms ctx on the connection: its deadline bounds every read and write,
+// and its cancellation aborts them. stop releases the watch.
+func (c *Conn) watch(ctx context.Context) (stop func() bool) {
 	deadline, _ := ctx.Deadline()
 	c.netc.SetDeadline(deadline)
+	c.ctx = ctx
+	return context.AfterFunc(ctx, c.abort)
+}
+
+// abort fails the I/O in flight and poisons the connection.
+func (c *Conn) abort() {
+	c.broken.Store(true)
+	c.netc.SetDeadline(time.Unix(1, 0))
 }
 
 func (c *Conn) handshake(ctx context.Context, cfg Config) error {
-	c.applyDeadline(ctx)
+	defer c.watch(ctx)()
 	defer c.netc.SetDeadline(time.Time{})
 	c.writeUvarint(clientHello)
 	c.writeString("go-rio/clickhouse")
@@ -168,7 +178,7 @@ func (c *Conn) handshake(ctx context.Context, cfg Config) error {
 
 // Ping round-trips a protocol ping.
 func (c *Conn) Ping(ctx context.Context) error {
-	c.applyDeadline(ctx)
+	defer c.watch(ctx)()
 	c.writeUvarint(clientPing)
 	if err := c.flush(); err != nil {
 		return c.fail(err)
@@ -189,9 +199,13 @@ func (c *Conn) Close() error { return c.netc.Close() }
 // Broken reports whether an earlier error poisoned the connection.
 func (c *Conn) Broken() bool { return c.broken.Load() }
 
-// fail marks the connection unusable and returns err.
+// fail marks the connection unusable and returns err, or the watched
+// context's error once that context is done.
 func (c *Conn) fail(err error) error {
 	c.broken.Store(true)
+	if cerr := c.ctx.Err(); cerr != nil {
+		return cerr
+	}
 	return err
 }
 

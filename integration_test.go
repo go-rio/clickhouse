@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-rio/clickhouse/internal/chproto"
 	"github.com/go-rio/rio"
 )
 
@@ -361,6 +362,122 @@ func TestTimePredicateOnSortingKey(t *testing.T) {
 	n, err := rio.From[TimeKeyed]().Where("at >= ? AND at < ?", rows[0].At.Add(-time.Hour), base).Count(ctx, db)
 	if err != nil || n != 1 {
 		t.Fatalf("pre-epoch window: %d %v", n, err)
+	}
+}
+
+type NarrowTime struct {
+	ID  uint64    `rio:",pk,noautoincr"`
+	At  time.Time // DateTime
+	Day time.Time // Date
+}
+
+// Time parameters land in DateTime and Date columns on both insert paths,
+// and instants outside those types' ranges fail instead of wrapping.
+func TestNarrowTimeColumns(t *testing.T) {
+	ctx := context.Background()
+	db := openTest(t)
+	if _, err := rio.Exec(ctx, db, "DROP TABLE IF EXISTS narrow_times"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rio.Exec(ctx, db, `CREATE TABLE narrow_times (
+		id UInt64, at DateTime, day Date,
+		created_at DateTime64(6, 'UTC'), updated_at DateTime64(6, 'UTC')
+	) ENGINE = MergeTree() ORDER BY id`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = rio.Exec(ctx, db, "DROP TABLE IF EXISTS narrow_times") })
+
+	at := time.Date(2026, 9, 1, 8, 30, 15, 0, time.FixedZone("CST", 8*3600))
+	if err := rio.Insert(ctx, db, &NarrowTime{ID: 1, At: at, Day: at}); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	if err := rio.InsertAll(ctx, db, []NarrowTime{{ID: 2, At: at, Day: at}}); err != nil {
+		t.Fatalf("InsertAll: %v", err)
+	}
+	got, err := rio.From[NarrowTime]().OrderBy("id").All(ctx, db)
+	if err != nil || len(got) != 2 {
+		t.Fatalf("All: %v %v", got, err)
+	}
+	for _, g := range got {
+		if !g.At.Equal(at) || !g.Day.Equal(time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)) {
+			t.Fatalf("row drifted: %+v", g)
+		}
+	}
+	// The zero time.Time precedes both ranges.
+	if err := rio.Insert(ctx, db, &NarrowTime{ID: 3, At: time.Time{}, Day: at}); err == nil {
+		t.Fatal("Insert must reject a zero DateTime")
+	}
+	if err := rio.Insert(ctx, db, &NarrowTime{ID: 4, At: at, Day: time.Time{}}); err == nil {
+		t.Fatal("Insert must reject a zero Date")
+	}
+	if err := rio.InsertAll(ctx, db, []NarrowTime{{ID: 5, At: time.Time{}, Day: at}}); err == nil {
+		t.Fatal("InsertAll must reject a zero DateTime")
+	}
+	if n, err := rio.From[NarrowTime]().Count(ctx, db); err != nil || n != 2 {
+		t.Fatalf("count after rejections: %d %v", n, err)
+	}
+}
+
+// A cancel-only context aborts an in-flight query promptly, and the pool
+// replaces the poisoned connection.
+func TestCancelMidQuery(t *testing.T) {
+	dsn := os.Getenv("RIO_CLICKHOUSE_DSN")
+	if dsn == "" {
+		t.Skip("RIO_CLICKHOUSE_DSN not set")
+	}
+	cfg, _, err := parseDSN(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	pool := chproto.NewPool(cfg, 1, 0, 0)
+	defer pool.Close()
+	c1, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// blocked before the first data block
+	qctx, cancel := context.WithCancel(ctx)
+	time.AfterFunc(100*time.Millisecond, cancel)
+	start := time.Now()
+	if _, err := c1.Query(qctx, "SELECT sleep(2)"); !errors.Is(err, context.Canceled) || time.Since(start) > time.Second {
+		t.Fatalf("err = %v after %v", err, time.Since(start))
+	}
+	pool.Release(c1)
+	c2, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c2 == c1 {
+		t.Fatal("the cancelled connection must not be reused")
+	}
+	// blocked mid-stream
+	qctx, cancel = context.WithCancel(ctx)
+	rows, err := c2.Query(qctx, "SELECT number FROM numbers(1000000000)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	start = time.Now()
+	for rows.Next() {
+	}
+	if err := rows.Close(); !errors.Is(err, context.Canceled) || time.Since(start) > time.Second {
+		t.Fatalf("mid-stream: err = %v after %v", err, time.Since(start))
+	}
+	pool.Release(c2)
+	c3, err := pool.Acquire(ctx)
+	if err != nil || c3 == c2 {
+		t.Fatalf("after the mid-stream cancel: %v %v", c3, err)
+	}
+	pool.Release(c3)
+
+	// the same through rio
+	db := openTest(t)
+	qctx, cancel = context.WithCancel(ctx)
+	time.AfterFunc(100*time.Millisecond, cancel)
+	type row struct{ N uint8 }
+	if _, err := rio.Raw[row]("SELECT sleep(2) AS n").All(qctx, db); !errors.Is(err, context.Canceled) {
+		t.Fatalf("rio: err = %v", err)
 	}
 }
 

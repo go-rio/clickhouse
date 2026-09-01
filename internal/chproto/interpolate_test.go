@@ -20,7 +20,10 @@ func TestInterpolate(t *testing.T) {
 		{"f = ?", []any{2.5}, "f = 2.5"},
 		{"f = ?", []any{float32(0.1)}, "f = 0.1"},
 		{"x = ? AND y = ?", []any{true, nil}, "x = true AND y = NULL"},
-		{"t = ?", []any{time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)}, "t = fromUnixTimestamp64Micro(1788256800000000, 'UTC')"},
+		{"t = ?", []any{time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)}, "t = toDateTime64('2026-09-01 10:00:00.000000', 6, 'UTC')"},
+		{"t = ?", []any{time.Date(2026, 9, 1, 18, 0, 0, 123456789, time.FixedZone("CST", 8*3600))}, "t = toDateTime64('2026-09-01 10:00:00.123456', 6, 'UTC')"},
+		{"t = ?", []any{time.Date(1969, 6, 1, 0, 0, 0, 500e6, time.UTC)}, "t = toDateTime64('1969-06-01 00:00:00.500000', 6, 'UTC')"},
+		{"t = ?", []any{time.Time{}}, "t = toDateTime64('0001-01-01 00:00:00.000000', 6, 'UTC')"},
 		// quoting contexts keep their question marks
 		{"s = '?' AND a = ?", []any{int64(1)}, "s = '?' AND a = 1"},
 		{"s = 'esc \\' ?' AND a = ?", []any{int64(1)}, "s = 'esc \\' ?' AND a = 1"},

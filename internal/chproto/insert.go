@@ -23,14 +23,28 @@ type Insert struct {
 	cols []Column
 	encs []encoder
 	rows int
+	stop func() bool // releases the statement's context watch
 
-	readDone chan error // buffered; the reader's terminal result
+	readDone chan struct{} // closed when the reader exits; readErr is then final
+	readErr  error
 }
 
 // BeginInsert sends "INSERT INTO ... VALUES" (no inline data) and consumes
 // the response up to the server's schema sample block.
 func (c *Conn) BeginInsert(ctx context.Context, query string) (*Insert, error) {
-	c.applyDeadline(ctx)
+	stop := c.watch(ctx)
+	in, err := c.beginInsert(query)
+	if err != nil {
+		stop()
+		return nil, err
+	}
+	in.stop = stop
+	go in.readLoop()
+	return in, nil
+}
+
+// beginInsert runs the statement up to the schema sample block.
+func (c *Conn) beginInsert(query string) (*Insert, error) {
 	if err := c.sendQuery(query); err != nil {
 		return nil, c.fail(&SendError{Err: err})
 	}
@@ -48,7 +62,7 @@ func (c *Conn) BeginInsert(ctx context.Context, query string) (*Insert, error) {
 			if err != nil {
 				return nil, c.fail(err)
 			}
-			in := &Insert{conn: c, cols: cols, encs: make([]encoder, len(cols)), readDone: make(chan error, 1)}
+			in := &Insert{conn: c, cols: cols, encs: make([]encoder, len(cols)), readDone: make(chan struct{})}
 			for i, col := range cols {
 				enc, err := newEncoder(col.Type)
 				if err != nil {
@@ -56,7 +70,6 @@ func (c *Conn) BeginInsert(ctx context.Context, query string) (*Insert, error) {
 				}
 				in.encs[i] = enc
 			}
-			go in.readLoop()
 			return in, nil
 		case serverException:
 			return nil, c.readException()
@@ -66,34 +79,31 @@ func (c *Conn) BeginInsert(ctx context.Context, query string) (*Insert, error) {
 	}
 }
 
-// readLoop drains server packets during the data stream and delivers the
+// readLoop drains server packets during the data stream and records the
 // terminal outcome: nil on EndOfStream, the Exception on abort.
 func (in *Insert) readLoop() {
+	defer close(in.readDone)
 	c := in.conn
 	for {
 		pt, err := c.nextPacket()
 		if err != nil {
-			in.readDone <- err
+			in.readErr = err
 			return
 		}
 		switch pt {
 		case serverEndOfStream:
-			in.readDone <- nil
 			return
 		case serverException:
-			err := c.readException()
-			// unblock a writer stuck on a full send buffer
-			c.broken.Store(true)
-			c.netc.SetWriteDeadline(time.Unix(1, 0))
-			in.readDone <- err
+			in.readErr = c.readException()
+			c.abort() // unblock a writer stuck on a full send buffer
 			return
 		case serverData: // a stray sample echo carries no rows
 			if err := c.skipMetaBlock(); err != nil {
-				in.readDone <- err
+				in.readErr = c.fail(err)
 				return
 			}
 		default:
-			in.readDone <- c.fail(fmt.Errorf("chproto: insert: unexpected packet %d", pt))
+			in.readErr = c.fail(fmt.Errorf("chproto: insert: unexpected packet %d", pt))
 			return
 		}
 	}
@@ -102,18 +112,17 @@ func (in *Insert) readLoop() {
 // Abort abandons the insert and poisons the connection — it cannot be
 // reused mid-stream.
 func (in *Insert) Abort() {
-	c := in.conn
-	c.broken.Store(true)
-	c.netc.SetDeadline(time.Unix(1, 0))
+	defer in.stop()
+	in.conn.abort()
 	<-in.readDone
 }
 
 // abortErr prefers the reader's error, when one arrives, over the writer's.
 func (in *Insert) abortErr(err error) error {
 	select {
-	case rerr := <-in.readDone:
-		if rerr != nil {
-			return rerr
+	case <-in.readDone:
+		if in.readErr != nil {
+			return in.readErr
 		}
 	case <-time.After(time.Second):
 	}
@@ -131,7 +140,7 @@ func (in *Insert) Append(vals []any) error {
 	}
 	for i, v := range vals {
 		if err := in.encs[i].append(v); err != nil {
-			return in.conn.fail(fmt.Errorf("column %q: %w", in.cols[i].Name, err))
+			return in.conn.fail(fmt.Errorf("column %q (%s): %w", in.cols[i].Name, in.cols[i].Type, err))
 		}
 	}
 	in.rows++
@@ -164,6 +173,7 @@ func (in *Insert) flush() error {
 // Commit sends buffered rows plus the end-of-data block and waits for the
 // reader's result. ClickHouse reports no row count.
 func (in *Insert) Commit() error {
+	defer in.stop()
 	c := in.conn
 	if in.rows > 0 {
 		if err := in.flush(); err != nil {
@@ -174,7 +184,8 @@ func (in *Insert) Commit() error {
 	if err := c.flush(); err != nil {
 		return in.abortErr(c.fail(err))
 	}
-	return <-in.readDone
+	<-in.readDone
+	return in.readErr
 }
 
 // --- column encoders ---
@@ -201,7 +212,7 @@ func (e *bufEnc) pad(n int) { e.buf = append(e.buf, zeros[:n]...) }
 
 func newEncoder(typ string) (encoder, error) {
 	switch typ {
-	case "UInt8":
+	case "UInt8", "Bool":
 		return &intEnc{size: 1}, nil
 	case "UInt16":
 		return &intEnc{size: 2}, nil
@@ -210,15 +221,13 @@ func newEncoder(typ string) (encoder, error) {
 	case "UInt64":
 		return &intEnc{size: 8}, nil
 	case "Int8":
-		return &intEnc{size: 1}, nil
+		return &intEnc{size: 1, signed: true}, nil
 	case "Int16":
-		return &intEnc{size: 2}, nil
+		return &intEnc{size: 2, signed: true}, nil
 	case "Int32":
-		return &intEnc{size: 4}, nil
+		return &intEnc{size: 4, signed: true}, nil
 	case "Int64":
-		return &intEnc{size: 8}, nil
-	case "Bool":
-		return &intEnc{size: 1}, nil
+		return &intEnc{size: 8, signed: true}, nil
 	case "Float32":
 		return &floatEnc{}, nil
 	case "Float64":
@@ -283,47 +292,49 @@ func newEncoder(typ string) (encoder, error) {
 	return nil, fmt.Errorf("chproto: unsupported insert column type %q", typ)
 }
 
-// asInt64 converts any integer-shaped binding, including named types.
-func asInt64(v any) (int64, bool) {
+// asInt64 converts any integer-shaped binding, including named types;
+// unsigned reports that n carries an unsigned bit pattern.
+func asInt64(v any) (n int64, unsigned, ok bool) {
 	switch n := v.(type) {
 	case int64:
-		return n, true
+		return n, false, true
 	case int:
-		return int64(n), true
+		return int64(n), false, true
 	case int32:
-		return int64(n), true
+		return int64(n), false, true
 	case int16:
-		return int64(n), true
+		return int64(n), false, true
 	case int8:
-		return int64(n), true
+		return int64(n), false, true
 	case uint64:
-		return int64(n), true
+		return int64(n), true, true
 	case uint32:
-		return int64(n), true
+		return int64(n), true, true
 	case uint16:
-		return int64(n), true
+		return int64(n), true, true
 	case uint8:
-		return int64(n), true
+		return int64(n), true, true
 	case uint:
-		return int64(n), true
+		return int64(n), true, true
 	}
 	rv := reflect.ValueOf(v)
 	switch rv.Kind() {
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		return rv.Int(), true
+		return rv.Int(), false, true
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		return int64(rv.Uint()), true
+		return int64(rv.Uint()), true, true
 	}
-	return 0, false
+	return 0, false, false
 }
 
 type intEnc struct {
 	bufEnc
-	size int
+	size   int
+	signed bool
 }
 
 func (e *intEnc) append(v any) error {
-	n, ok := asInt64(v)
+	n, unsigned, ok := asInt64(v)
 	if !ok {
 		if b, ok := v.(bool); ok { // Bool column bound as 0/1 or true/false
 			n = 0
@@ -333,6 +344,9 @@ func (e *intEnc) append(v any) error {
 		} else {
 			return fmt.Errorf("cannot bind %T as an integer", v)
 		}
+	}
+	if !e.fits(n, unsigned) {
+		return fmt.Errorf("%v is out of range", v)
 	}
 	switch e.size {
 	case 8:
@@ -347,6 +361,22 @@ func (e *intEnc) append(v any) error {
 	return nil
 }
 
+// fits reports whether n, an unsigned bit pattern when unsigned, is
+// representable in the column.
+func (e *intEnc) fits(n int64, unsigned bool) bool {
+	if e.size == 8 {
+		return e.signed != unsigned || n >= 0
+	}
+	if e.signed {
+		lim := int64(1) << (e.size*8 - 1)
+		if unsigned {
+			return uint64(n) < uint64(lim)
+		}
+		return -lim <= n && n < lim
+	}
+	return (unsigned || n >= 0) && uint64(n)>>(e.size*8) == 0
+}
+
 func (e *intEnc) appendZero() { e.pad(e.size) }
 
 type floatEnc struct {
@@ -357,10 +387,14 @@ type floatEnc struct {
 func (e *floatEnc) append(v any) error {
 	f, ok := asFloat64(v)
 	if !ok {
-		if i, iok := asInt64(v); iok {
-			f = float64(i)
-		} else {
+		i, unsigned, iok := asInt64(v)
+		switch {
+		case !iok:
 			return fmt.Errorf("cannot bind %T as a float", v)
+		case unsigned:
+			f = float64(uint64(i))
+		default:
+			f = float64(i)
 		}
 	}
 	if e.wide {
@@ -460,7 +494,7 @@ func (e *enumEnc) append(v any) error {
 		if !ok {
 			return fmt.Errorf("enum has no member %q", s)
 		}
-	} else if i, ok := asInt64(v); ok {
+	} else if i, _, ok := asInt64(v); ok {
 		n = i
 	} else {
 		return fmt.Errorf("cannot bind %T as an enum", v)
@@ -538,9 +572,14 @@ func (e *timeEnc) append(v any) error {
 	}
 	var n int64
 	if e.dayBased {
-		n = t.Unix() / 86400
+		sec := t.Unix()
+		n = sec / 86400
+		if sec%86400 < 0 {
+			n--
+		}
 	} else {
-		n = t.UnixNano() / e.unit
+		tps := int64(time.Second) / e.unit
+		n = t.Unix()*tps + int64(t.Nanosecond())/e.unit
 	}
 	// Date and DateTime are unsigned and narrow; out-of-range instants
 	// would otherwise wrap silently.
@@ -599,7 +638,7 @@ func (e *decimalEnc) append(v any) error {
 				}
 				neg = false // already two's complement
 			}
-		} else if n, ok := asInt64(v); ok {
+		} else if n, _, ok := asInt64(v); ok {
 			for range e.scale {
 				n *= 10
 			}
@@ -729,9 +768,11 @@ func (e *int128Enc) append(v any) error {
 				hi++
 			}
 		}
-	} else if n, ok := asInt64(v); ok {
+	} else if n, unsigned, ok := asInt64(v); ok {
 		lo = uint64(n)
-		hi = uint64(n >> 63)
+		if !unsigned {
+			hi = uint64(n >> 63)
+		}
 	} else {
 		return fmt.Errorf("cannot bind %T as a 128-bit integer", v)
 	}

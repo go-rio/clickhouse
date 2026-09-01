@@ -66,7 +66,9 @@ Reads support the full builder, relations, and Raw. Writes are `Insert`,
 `InsertAll`, and `Exec`; rio rejects transactions, row locks, synchronous
 update/delete, conflict upserts, and statement caching at the dialect
 level. Generated values are never backfilled — supply IDs yourself
-(`rio:",noautoincr"`). Parameters bind client-side.
+(`rio:",noautoincr"`). Parameters bind client-side. Every query runs with
+`date_time_overflow_behavior = 'throw'`, so an instant that does not fit a
+`Date` or `DateTime` column fails instead of wrapping.
 
 Server errors are `*clickhouse.Exception` via `errors.As`. There is no
 constraint-error translator: ClickHouse has no unique or foreign key

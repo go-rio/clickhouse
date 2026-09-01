@@ -26,7 +26,7 @@ func (e *Exception) Error() string {
 }
 
 // sendQuery writes a Query packet and the empty external-data block. Every
-// query carries the LowCardinality opt-out, so those columns arrive plain.
+// query carries the LowCardinality opt-out and the throwing time-overflow mode.
 func (c *Conn) sendQuery(query string) error {
 	c.writeUvarint(clientQuery)
 	c.writeString("") // query id: server assigns
@@ -55,6 +55,9 @@ func (c *Conn) sendQuery(query string) error {
 	c.writeString("low_cardinality_allow_in_native_format")
 	c.writeUvarint(0)
 	c.writeString("0")
+	c.writeString("date_time_overflow_behavior")
+	c.writeUvarint(0)
+	c.writeString("throw")
 	c.writeString("")
 	c.writeString("") // interserver secret
 	c.writeUvarint(2) // stage: complete
@@ -276,15 +279,16 @@ func (c *Conn) readMetaColumns() ([]Column, error) {
 // Query executes a row-returning statement. The connection owns the returned
 // Rows and recycles it on the next Query; drain or Close it first.
 func (c *Conn) Query(ctx context.Context, query string) (*Rows, error) {
-	c.applyDeadline(ctx)
+	stop := c.watch(ctx)
 	if err := c.sendQuery(query); err != nil {
+		stop()
 		return nil, c.fail(&SendError{Err: err})
 	}
 	if c.rows == nil {
 		c.rows = &Rows{conn: c}
 	}
 	rows := c.rows
-	rows.reset()
+	rows.reset(stop)
 	// prefetch so execution errors surface here, not at the first Next
 	if err := rows.pump(); err != nil {
 		return nil, err

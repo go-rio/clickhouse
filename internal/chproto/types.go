@@ -403,7 +403,8 @@ func (d *timeCol) TimeAt(i int) time.Time {
 		}
 		return time.Unix(v*86400, 0).UTC()
 	}
-	return time.Unix(0, v*d.unit).In(d.loc)
+	tps := int64(time.Second) / d.unit
+	return time.Unix(v/tps, (v%tps)*d.unit).In(d.loc)
 }
 
 // decimalCol decodes Decimal columns (scaled little-endian integers) into

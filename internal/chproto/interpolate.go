@@ -168,11 +168,11 @@ func appendLiteral(buf []byte, v any) ([]byte, error) {
 		}
 		return append(buf, "false"...), nil
 	case time.Time:
-		// Epoch-microsecond function form: the primary-key range analyzer
-		// rejects offset-carrying text literals.
-		buf = append(buf, "fromUnixTimestamp64Micro("...)
-		buf = strconv.AppendInt(buf, x.UnixMicro(), 10)
-		return append(buf, ", 'UTC')"...), nil
+		// UTC text through toDateTime64: the VALUES parser casts it into
+		// every date/time column type and the key analyzer folds it.
+		buf = append(buf, "toDateTime64('"...)
+		buf = x.UTC().AppendFormat(buf, "2006-01-02 15:04:05.000000")
+		return append(buf, "', 6, 'UTC')"...), nil
 	}
 	rv := reflect.ValueOf(v)
 	switch rv.Kind() {

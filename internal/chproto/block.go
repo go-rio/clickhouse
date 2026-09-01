@@ -12,6 +12,7 @@ type Column struct {
 // queries. Accessors return borrowed data valid only until the next Next.
 type Rows struct {
 	conn  *Conn
+	stop  func() bool // releases the query's context watch
 	cols  []Column
 	decs  []Decoder
 	names []string // built by Names, reset with the column shape
@@ -24,7 +25,8 @@ type Rows struct {
 }
 
 // reset readies the Rows for a fresh query, keeping decoders for reuse.
-func (r *Rows) reset() {
+func (r *Rows) reset(stop func() bool) {
+	r.stop = stop
 	r.rows, r.idx, r.blockSeen, r.done, r.err = 0, -1, false, false, nil
 }
 
@@ -76,32 +78,33 @@ func (r *Rows) pump() error {
 	for {
 		pt, err := c.nextPacket()
 		if err != nil {
-			r.err = err
-			return err
+			return r.finish(err)
 		}
 		switch pt {
 		case serverData:
 			nrows, err := r.readBlock()
 			if err != nil {
-				r.err = err
-				return err
+				return r.finish(err)
 			}
 			if nrows > 0 {
 				r.rows = nrows
 				return nil
 			}
 		case serverEndOfStream:
-			r.done = true
-			return nil
+			return r.finish(nil)
 		case serverException:
-			r.err = c.readException()
-			r.done = true
-			return r.err
+			return r.finish(c.readException())
 		default:
-			r.err = c.fail(fmt.Errorf("chproto: unexpected packet %d", pt))
-			return r.err
+			return r.finish(c.fail(fmt.Errorf("chproto: unexpected packet %d", pt)))
 		}
 	}
+}
+
+// finish ends the stream with err and releases the context watch.
+func (r *Rows) finish(err error) error {
+	r.done, r.err = true, err
+	r.stop()
+	return err
 }
 
 // readBlock decodes one data block into the reused column decoders.
