@@ -1,0 +1,134 @@
+# go-rio/clickhouse
+
+> ClickHouse driver module for the rio ORM: the native TCP protocol implemented in Go with no third-party dependencies.
+
+## Overview
+
+`github.com/go-rio/clickhouse` connects rio (https://github.com/go-rio/rio) to ClickHouse 26+ over the server's native TCP protocol (revision 54460, uncompressed), implemented in `internal/chproto`. `Open` returns a `*rio.DB` on rio's native channel: result blocks decode straight into rio's typed scan cells and `rio.InsertAll` streams native column blocks. `OpenSQL` serves a plain `database/sql` handle over the same protocol for tools such as go-rio/migrate. It is for Go services that read and write ClickHouse through rio's query builder.
+
+## Quick Start
+
+```sh
+go get github.com/go-rio/clickhouse
+```
+
+```go
+package main
+
+import (
+	"context"
+	"log"
+
+	rioch "github.com/go-rio/clickhouse"
+	"github.com/go-rio/rio"
+)
+
+// CREATE TABLE events (id UInt64, kind String) ENGINE = MergeTree ORDER BY id
+type Event struct {
+	ID   uint64 `rio:",pk,noautoincr"` // ClickHouse never backfills generated values
+	Kind string
+}
+
+func main() {
+	ctx := context.Background()
+	db, err := rioch.Open(ctx, "clickhouse://default:secret@localhost:9000/analytics")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := rio.Insert(ctx, db, &Event{ID: 1, Kind: "click"}); err != nil {
+		log.Fatal(err)
+	}
+	events, err := rio.From[Event]().Where("kind = ?", "click").All(ctx, db)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("%d click events", len(events))
+}
+```
+
+## Key Concepts
+
+- **DSN**: `clickhouse://user:password@host:port/database` plus the parameters `username`, `password`, `database`, `secure`, `skip_verify`, `dial_timeout` (default 10s), `max_open_conns` (8), `conn_max_idle_time` (5m), and `conn_max_lifetime` (1h). The port defaults to 9000, user and database to `default`; unknown parameters are rejected.
+- **Native channel**: `Open` builds the `*rio.DB` through `rio.NewNative`. Reads support the full builder, relations, and `rio.Raw`; writes are `rio.Insert`, `rio.InsertAll` (native column blocks), and `rio.Exec`. rio rejects transactions, row locks, synchronous update/delete, conflict upserts, and statement caching at the dialect level.
+- **No backfill**: ClickHouse never returns generated values; declare primary keys `rio:",pk,noautoincr"` and supply IDs.
+- **Client-side binding**: `?` placeholders are replaced with literals under ClickHouse quoting rules (`'...'` strings with `\` escapes, backquoted and double-quoted identifiers, `--` and `/* */` comments; `\?` renders a literal question mark). `time.Time` renders as `toDateTime64('YYYY-MM-DD HH:MM:SS.ffffff', 6, 'UTC')`, `uint64` binds as-is, nil is `NULL`, NaN and infinities are rejected.
+- **Range guards**: every query is sent with `date_time_overflow_behavior = 'throw'`. On the block insert path, integers are range-checked by column width and sign, `Date` ([1970-01-01, 2149-06-06]) and `DateTime` ([1970-01-01, 2106-02-07]) reject out-of-range instants, `Date32` floors pre-1970 days, and `DateTime64` covers 1900–2299 below precision 9.
+- **Column types**: integers of every width plus `Int128`/`UInt128` (decimal text), `Float32/64`, `Decimal` to 38 digits (fixed-scale text), `Bool`, `String`, `FixedString`, `Enum8/16`, `UUID`, `IPv4`/`IPv6`, `Date`, `Date32`, `DateTime`, `DateTime64`, `SimpleAggregateFunction` of these, and `Nullable` of each. `LowCardinality` reads and writes as its plain type. `Array`, `Map`, `Tuple`, and `Decimal256` are not supported.
+- **Connections**: one query per connection at a time. Idle connections are probed for a peer close before reuse and expire after `conn_max_idle_time`; every connection is replaced after `conn_max_lifetime`. A query whose transmission failed is retried once on a fresh connection. Every operation honors its context: cancellation aborts the I/O immediately, surfaces as the context error, and discards the connection. A server exception leaves the connection reusable; I/O and protocol errors poison it.
+
+## API Reference
+
+### Core Functions
+
+- `Open(ctx context.Context, dsn string, opts ...rio.Option) (*rio.DB, error)` - connects rio's native channel and verifies it with a ping. Fails on a malformed DSN or when the dial, handshake, or ping fails. `db.Unwrap()` returns a `database/sql` view over its own connections.
+- `OpenSQL(dsn string) (*sql.DB, error)` - a plain `database/sql` handle over the native protocol, the handle go-rio/migrate consumes. `?` placeholders, no transactions or prepared statements, affected-row counts always zero. No connection is made until first use; only a malformed DSN fails here.
+
+### Core Types
+
+- `Exception` - a ClickHouse server error with `Code int32`, `Name string`, and `Message string`; reach it with `errors.As`. There is no constraint-error translation because ClickHouse has no unique or foreign-key constraints.
+
+## Common Patterns
+
+### Query with the builder
+
+```go
+recent, err := rio.From[Event]().
+	Where("kind = ? AND at >= ?", "click", time.Now().Add(-time.Hour)).
+	OrderBy("at DESC").
+	Limit(100).
+	All(ctx, db)
+```
+
+### Bulk insert through native column blocks
+
+```go
+rows := make([]Event, 0, 10_000)
+for i := range 10_000 {
+	rows = append(rows, Event{ID: uint64(i + 1), Kind: "click"})
+}
+if err := rio.InsertAll(ctx, db, rows); err != nil {
+	return err
+}
+```
+
+### database/sql and migrations
+
+```go
+sqlDB, err := rioch.OpenSQL(dsn)
+if err != nil {
+	return err
+}
+defer sqlDB.Close()
+m, err := migrate.New(sqlDB, migrate.ClickHouse)
+```
+
+### Timeouts and cancellation
+
+```go
+ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+defer cancel()
+n, err := rio.From[Event]().Count(ctx, db) // context.DeadlineExceeded past 5s
+```
+
+## Error Handling
+
+- `*clickhouse.Exception` - the server rejected the statement; `errors.As(err, &ex)` exposes `ex.Code`, `ex.Name`, and `ex.Message`. The connection stays usable.
+- `context.Canceled` / `context.DeadlineExceeded` - the operation's context ended; the connection was discarded.
+- `clickhouse: bad DSN ...` / `clickhouse: unsupported DSN parameter ...` - `Open` and `OpenSQL` reject the DSN before connecting.
+- `clickhouse: open: ...` - the initial dial, handshake, or ping failed.
+- `chproto: N placeholders but M arguments` - placeholder and argument counts differ.
+- `column "name" (Type): ... is out of range` / `... is outside the Date range ...` - a value did not fit its column on the block insert path; the insert is aborted and the connection discarded.
+- `chproto: unsupported column type ...` - a result or insert column is `Array`, `Map`, `Tuple`, or another type outside the supported set.
+- `clickhouse: transactions are not supported` - reached only through `database/sql`'s `Begin`; rio's dialect rejects transactions earlier.
+- `driver.ErrBadConn` - the `database/sql` shim's report of a failed transmission; database/sql retries on a fresh connection.
+
+## References
+
+- README: https://github.com/go-rio/clickhouse/blob/main/README.md
+- CHANGELOG: https://github.com/go-rio/clickhouse/blob/main/CHANGELOG.md
+- Repository: https://github.com/go-rio/clickhouse
+- Go Reference: https://pkg.go.dev/github.com/go-rio/clickhouse
+- Core ORM: https://github.com/go-rio/rio
+- Issues: https://github.com/go-rio/clickhouse/issues
