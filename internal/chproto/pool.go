@@ -10,6 +10,12 @@ import (
 // ErrPoolClosed is returned by Acquire after Close.
 var ErrPoolClosed = errors.New("chproto: pool is closed")
 
+// idleConn is a pooled connection and the time it went idle.
+type idleConn struct {
+	c     *Conn
+	since time.Time
+}
+
 // Pool hands out connections one query at a time. Broken connections are
 // discarded on release; idle ones expire after maxIdle, every connection
 // after maxLife.
@@ -22,11 +28,6 @@ type Pool struct {
 	mu     sync.Mutex
 	idle   []idleConn // oldest first
 	closed bool
-}
-
-type idleConn struct {
-	c     *Conn
-	since time.Time
 }
 
 // NewPool creates a pool of at most maxOpen connections that dial lazily.
@@ -44,8 +45,9 @@ func NewPool(cfg Config, maxOpen int, maxIdle, maxLife time.Duration) *Pool {
 	return &Pool{cfg: cfg, maxIdle: maxIdle, maxLife: maxLife, slots: make(chan struct{}, maxOpen)}
 }
 
-// Acquire returns a connection, dialing when no live idle one exists.
-// Idle candidates are probed for a peer close before reuse.
+// Acquire returns a connection, dialing when no live idle one exists. Idle
+// candidates are probed for a peer close before reuse. It blocks while every
+// slot is busy and fails with ctx's error, a dial error, or ErrPoolClosed.
 func (p *Pool) Acquire(ctx context.Context) (*Conn, error) {
 	select {
 	case p.slots <- struct{}{}:
@@ -119,7 +121,7 @@ func (p *Pool) Close() error {
 	return nil
 }
 
-// Ping verifies connectivity.
+// Ping acquires a connection and round-trips a protocol ping.
 func (p *Pool) Ping(ctx context.Context) error {
 	c, err := p.Acquire(ctx)
 	if err != nil {

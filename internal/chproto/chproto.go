@@ -1,7 +1,12 @@
-// Package chproto speaks the ClickHouse native TCP protocol directly, with
-// no third-party dependencies and no compression. The client pins protocol
-// revision 54460; the server negotiates down to it, freezing every frame
-// layout implemented here.
+// Package chproto implements the ClickHouse native TCP protocol for the
+// clickhouse driver module, with no third-party dependencies and no
+// compression. The client pins protocol revision 54460; the server
+// negotiates down to it, freezing every frame layout implemented here.
+//
+// Entry points: Dial opens one Conn and Pool hands Conns out one operation
+// at a time; Conn.Query and Conn.Exec run SQL rendered by Interpolate and
+// stream results through Rows and its column Decoders; Conn.BeginInsert
+// streams native column blocks through Insert.
 package chproto
 
 import (
@@ -49,8 +54,8 @@ type Config struct {
 	Database string
 	User     string
 	Password string
-	TLS      *tls.Config // nil for plaintext
-	Timeout  time.Duration
+	TLS      *tls.Config   // nil for plaintext
+	Timeout  time.Duration // dial timeout
 }
 
 // Conn is one native-protocol connection; not safe for concurrent use.
@@ -70,7 +75,9 @@ type Conn struct {
 	broken  atomic.Bool // an I/O or protocol error poisons the connection
 }
 
-// Dial connects and completes the handshake.
+// Dial connects, over TLS when cfg.TLS is set, and completes the handshake.
+// It fails on a dial or TLS error, on a server exception, or when the server
+// speaks a revision below Revision.
 func Dial(ctx context.Context, cfg Config) (*Conn, error) {
 	d := net.Dialer{Timeout: cfg.Timeout}
 	netc, err := d.DialContext(ctx, "tcp", cfg.Addr)
@@ -176,7 +183,7 @@ func (c *Conn) handshake(ctx context.Context, cfg Config) error {
 	return c.flush()
 }
 
-// Ping round-trips a protocol ping.
+// Ping round-trips a protocol ping; any failure poisons the connection.
 func (c *Conn) Ping(ctx context.Context) error {
 	defer c.watch(ctx)()
 	c.writeUvarint(clientPing)
@@ -193,7 +200,7 @@ func (c *Conn) Ping(ctx context.Context) error {
 	return nil
 }
 
-// Close tears the connection down.
+// Close closes the network connection; the protocol has no farewell packet.
 func (c *Conn) Close() error { return c.netc.Close() }
 
 // Broken reports whether an earlier error poisoned the connection.

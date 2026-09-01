@@ -10,19 +10,22 @@ import (
 	"github.com/go-rio/clickhouse/internal/chproto"
 )
 
-// OpenSQL opens a plain database/sql handle over the native protocol.
+// shimConnector dials one native connection per database/sql connection.
+type shimConnector struct {
+	cfg chproto.Config
+}
+
+// OpenSQL opens a plain database/sql handle over the native protocol; it
+// accepts the same DSN as Open and is the handle go-rio/migrate consumes.
 // Placeholders are ? and interpolate client-side; there are no transactions
-// or prepared statements, and affected-row counts are always zero.
+// or prepared statements, and affected-row counts are always zero. No
+// connection is made until first use; only a malformed DSN fails here.
 func OpenSQL(dsn string) (*sql.DB, error) {
 	cfg, _, err := parseDSN(dsn)
 	if err != nil {
 		return nil, err
 	}
 	return sql.OpenDB(shimConnector{cfg: cfg}), nil
-}
-
-type shimConnector struct {
-	cfg chproto.Config
 }
 
 func (c shimConnector) Connect(ctx context.Context) (driver.Conn, error) {
@@ -35,6 +38,8 @@ func (c shimConnector) Connect(ctx context.Context) (driver.Conn, error) {
 
 func (c shimConnector) Driver() driver.Driver { return shimDriver{} }
 
+// shimDriver backs shimConnector.Driver; sql.OpenDB never opens by DSN, so
+// Open only errors.
 type shimDriver struct{}
 
 func (shimDriver) Open(string) (driver.Conn, error) {
@@ -84,27 +89,6 @@ func (c *shimConn) QueryContext(ctx context.Context, query string, args []driver
 	return &shimRows{rows: rows}, nil
 }
 
-// badConnOr maps SendError to ErrBadConn so database/sql retries it on a
-// fresh connection.
-func badConnOr(err error) error {
-	var send *chproto.SendError
-	if errors.As(err, &send) {
-		return driver.ErrBadConn
-	}
-	return err
-}
-
-func namedToAny(args []driver.NamedValue) []any {
-	if len(args) == 0 {
-		return nil
-	}
-	out := make([]any, len(args))
-	for i, a := range args {
-		out[i] = a.Value
-	}
-	return out
-}
-
 type shimRows struct {
 	rows *chproto.Rows
 }
@@ -144,6 +128,27 @@ func (r *shimRows) Next(dest []driver.Value) error {
 		}
 	}
 	return nil
+}
+
+// badConnOr maps SendError to ErrBadConn so database/sql retries it on a
+// fresh connection.
+func badConnOr(err error) error {
+	var send *chproto.SendError
+	if errors.As(err, &send) {
+		return driver.ErrBadConn
+	}
+	return err
+}
+
+func namedToAny(args []driver.NamedValue) []any {
+	if len(args) == 0 {
+		return nil
+	}
+	out := make([]any, len(args))
+	for i, a := range args {
+		out[i] = a.Value
+	}
+	return out
 }
 
 var _ interface {

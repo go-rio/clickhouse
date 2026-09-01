@@ -1,9 +1,10 @@
-// Package clickhouse connects rio to ClickHouse over its native TCP
-// protocol, implemented in-repo with no third-party dependencies.
+// Package clickhouse is the ClickHouse driver module for rio. It speaks the
+// server's native TCP protocol in-repo, with no third-party dependencies.
 //
-// ClickHouse 26.7 or newer is required. Server errors are reachable as
-// *clickhouse.Exception through errors.As; there is no constraint-error
-// translation.
+// Open connects rio's native channel and returns a *rio.DB; OpenSQL serves a
+// plain database/sql handle over the same protocol. ClickHouse 26.7 or newer
+// is required. Server errors are reachable as *Exception through errors.As;
+// there is no constraint-error translation.
 package clickhouse
 
 import (
@@ -21,16 +22,27 @@ import (
 	"github.com/go-rio/rio"
 )
 
-// Exception is a ClickHouse server error.
+// Exception is a ClickHouse server error, reachable from any driver error
+// through errors.As. Code, Name, and Message are the server's.
 type Exception = chproto.Exception
 
-// Open connects the native channel and verifies it with a ping. The DSN is
-// clickhouse://user:password@host:port/database with optional parameters
-// secure, skip_verify, dial_timeout, max_open_conns, conn_max_idle_time,
-// and conn_max_lifetime.
+// poolOptions carries the DSN's pool tuning.
+type poolOptions struct {
+	maxOpen int
+	maxIdle time.Duration
+	maxLife time.Duration
+}
+
+// Open connects rio's native channel to ClickHouse and verifies it with a
+// ping. The DSN is clickhouse://user:password@host:port/database with the
+// optional parameters username, password, database, secure, skip_verify,
+// dial_timeout, max_open_conns, conn_max_idle_time, and conn_max_lifetime;
+// the port defaults to 9000, user and database to "default", and unknown
+// parameters are rejected.
 //
 // The returned DB's Unwrap serves a database/sql view over its own
-// connections.
+// connections. Open fails on a malformed DSN or when the dial, handshake,
+// or ping fails.
 func Open(ctx context.Context, dsn string, opts ...rio.Option) (*rio.DB, error) {
 	cfg, po, err := parseDSN(dsn)
 	if err != nil {
@@ -44,13 +56,6 @@ func Open(ctx context.Context, dsn string, opts ...rio.Option) (*rio.DB, error) 
 	view := sql.OpenDB(shimConnector{cfg: cfg})
 	nd := &nativeDB{pool: pool}
 	return rio.NewNative(rio.NativeConfig{DB: nd, Handle: pool, SQLView: view}, rio.ClickHouse, opts...), nil
-}
-
-// poolOptions carries the DSN's pool tuning.
-type poolOptions struct {
-	maxOpen int
-	maxIdle time.Duration
-	maxLife time.Duration
 }
 
 // parseDSN interprets clickhouse:// URLs.

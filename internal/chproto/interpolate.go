@@ -13,6 +13,10 @@ import (
 // Interpolate substitutes ? placeholders with SQL literals, honoring
 // ClickHouse quoting: '...' strings (with \ escapes), `...` and "..."
 // identifiers, -- and /* */ comments, and the \? literal-question escape.
+// driver.Valuer arguments resolve first; strings quote with \ escapes, times
+// render as toDateTime64 UTC literals, nil as NULL. It fails on a
+// placeholder/argument count mismatch, an unterminated quote or comment, a
+// non-finite float, or an unsupported argument type.
 func Interpolate(query string, args []any) (string, error) {
 	if len(args) == 0 && !strings.ContainsRune(query, '?') {
 		return query, nil
@@ -75,13 +79,14 @@ func Interpolate(query string, args []any) (string, error) {
 			if i+1 < len(query) && query[i+1] == '*' {
 				depth, end := 1, i+2
 				for end < len(query) && depth > 0 {
-					if end+1 < len(query) && query[end] == '/' && query[end+1] == '*' {
+					switch {
+					case strings.HasPrefix(query[end:], "/*"):
 						depth++
 						end += 2
-					} else if end+1 < len(query) && query[end] == '*' && query[end+1] == '/' {
+					case strings.HasPrefix(query[end:], "*/"):
 						depth--
 						end += 2
-					} else {
+					default:
 						end++
 					}
 				}
@@ -103,7 +108,9 @@ func Interpolate(query string, args []any) (string, error) {
 	return string(buf), nil
 }
 
-// skipQuoted returns the index just past the closing quote.
+// skipQuoted returns the index just past the closing quote, or false when
+// the literal is unterminated; doubled quotes and, with backslash, \-escapes
+// stay inside it.
 func skipQuoted(s string, start int, quote byte, backslash bool) (int, bool) {
 	for i := start + 1; i < len(s); i++ {
 		switch s[i] {
@@ -205,7 +212,7 @@ func appendFloat(buf []byte, f float64, bits int) ([]byte, error) {
 // appendQuoted writes a single-quoted literal, escaping backslash and quote.
 func appendQuoted(buf []byte, s string) []byte {
 	buf = append(buf, '\'')
-	for i := 0; i < len(s); i++ {
+	for i := range len(s) {
 		switch s[i] {
 		case '\'':
 			buf = append(buf, '\\', '\'')

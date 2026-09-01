@@ -125,15 +125,11 @@ func (d *nativeDB) CopyIn(ctx context.Context, table []string, columns []string,
 	return n, in.Commit()
 }
 
-func quoteIdent(b *strings.Builder, name string) {
-	b.WriteByte('`')
-	for i := 0; i < len(name); i++ {
-		if name[i] == '`' || name[i] == '\\' {
-			b.WriteByte('\\')
-		}
-		b.WriteByte(name[i])
-	}
-	b.WriteByte('`')
+// scanStep is one column's row-invariant scan strategy.
+type scanStep struct {
+	dec      chproto.Decoder
+	kind     chproto.Kind
+	rawBytes bool // the cell takes SetBytes over an owned-string copy
 }
 
 // nativeRows adapts a protocol result stream to rio's NativeRows. rio passes
@@ -145,13 +141,6 @@ type nativeRows struct {
 	plan     []scanStep
 	released bool
 	err      error // cached by Close
-}
-
-// scanStep is one column's row-invariant scan strategy.
-type scanStep struct {
-	dec      chproto.Decoder
-	kind     chproto.Kind
-	rawBytes bool // the cell takes SetBytes over an owned-string copy
 }
 
 func (r *nativeRows) Columns() []string { return r.rows.Names() }
@@ -228,4 +217,16 @@ func (r *nativeRows) Close() {
 	r.released = true
 	r.err = r.rows.Close()
 	r.pool.Release(r.conn)
+}
+
+// quoteIdent appends name as a backquoted identifier.
+func quoteIdent(b *strings.Builder, name string) {
+	b.WriteByte('`')
+	for i := range len(name) {
+		if name[i] == '`' || name[i] == '\\' {
+			b.WriteByte('\\')
+		}
+		b.WriteByte(name[i])
+	}
+	b.WriteByte('`')
 }

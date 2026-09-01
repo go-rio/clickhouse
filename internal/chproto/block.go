@@ -2,7 +2,7 @@ package chproto
 
 import "fmt"
 
-// Column describes one block column.
+// Column is one result column: its name and ClickHouse type string.
 type Column struct {
 	Name string
 	Type string
@@ -44,7 +44,7 @@ func (r *Rows) Names() []string {
 	return r.names
 }
 
-// Decoder exposes column i's typed accessor for the current row.
+// Decoder returns column i's typed accessor; index it with Row.
 func (r *Rows) Decoder(i int) Decoder { return r.decs[i] }
 
 // Row returns the current row index within the block.

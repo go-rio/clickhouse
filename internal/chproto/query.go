@@ -11,18 +11,55 @@ type SendError struct {
 	Err error
 }
 
+// Error reports the underlying transport error's message.
 func (e *SendError) Error() string { return e.Err.Error() }
+
+// Unwrap exposes the transport error to errors.Is and errors.As.
 func (e *SendError) Unwrap() error { return e.Err }
 
-// Exception is a server-reported error.
+// Exception is a server-reported error: the ClickHouse error code, its name,
+// and the message. A query that ends in an Exception leaves the connection
+// reusable.
 type Exception struct {
 	Code    int32
 	Name    string
 	Message string
 }
 
+// Error formats the exception as "clickhouse: NAME (code N): message".
 func (e *Exception) Error() string {
 	return fmt.Sprintf("clickhouse: %s (code %d): %s", e.Name, e.Code, e.Message)
+}
+
+// Query executes a row-returning statement. The connection owns the returned
+// Rows and recycles it on the next Query; drain or Close it first. A failed
+// transmission returns a SendError; execution errors surface here rather
+// than at the first Next.
+func (c *Conn) Query(ctx context.Context, query string) (*Rows, error) {
+	stop := c.watch(ctx)
+	if err := c.sendQuery(query); err != nil {
+		stop()
+		return nil, c.fail(&SendError{Err: err})
+	}
+	if c.rows == nil {
+		c.rows = &Rows{conn: c}
+	}
+	rows := c.rows
+	rows.reset(stop)
+	// prefetch so execution errors surface here, not at the first Next
+	if err := rows.pump(); err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+// Exec executes a statement and drains its response.
+func (c *Conn) Exec(ctx context.Context, query string) error {
+	rows, err := c.Query(ctx, query)
+	if err != nil {
+		return err
+	}
+	return rows.Close()
 }
 
 // sendQuery writes a Query packet and the empty external-data block. Every
@@ -84,6 +121,8 @@ func (c *Conn) writeBlockHeader(cols, rows int) {
 	c.writeUvarint(uint64(rows))
 }
 
+// readException consumes an exception packet and returns the innermost
+// exception of a nested chain.
 func (c *Conn) readException() error {
 	first := &Exception{}
 	cur := first
@@ -123,6 +162,7 @@ func (c *Conn) skipProgress() error {
 	return nil
 }
 
+// skipProfileInfo consumes a ProfileInfo packet (v = varint, b = byte fields).
 func (c *Conn) skipProfileInfo() error {
 	for _, kind := range [6]byte{'v', 'v', 'v', 'b', 'v', 'b'} {
 		var err error
@@ -267,40 +307,13 @@ func (c *Conn) readMetaColumns() ([]Column, error) {
 		if out[i].Type, err = c.readString(); err != nil {
 			return nil, err
 		}
-		if flag, err := c.readByte(); err != nil {
+		var flag byte
+		if flag, err = c.readByte(); err != nil {
 			return nil, err
-		} else if flag != 0 {
+		}
+		if flag != 0 {
 			return nil, fmt.Errorf("chproto: column %q uses custom serialization", out[i].Name)
 		}
 	}
 	return out, nil
-}
-
-// Query executes a row-returning statement. The connection owns the returned
-// Rows and recycles it on the next Query; drain or Close it first.
-func (c *Conn) Query(ctx context.Context, query string) (*Rows, error) {
-	stop := c.watch(ctx)
-	if err := c.sendQuery(query); err != nil {
-		stop()
-		return nil, c.fail(&SendError{Err: err})
-	}
-	if c.rows == nil {
-		c.rows = &Rows{conn: c}
-	}
-	rows := c.rows
-	rows.reset(stop)
-	// prefetch so execution errors surface here, not at the first Next
-	if err := rows.pump(); err != nil {
-		return nil, err
-	}
-	return rows, nil
-}
-
-// Exec executes a statement and drains its response.
-func (c *Conn) Exec(ctx context.Context, query string) error {
-	rows, err := c.Query(ctx, query)
-	if err != nil {
-		return err
-	}
-	return rows.Close()
 }

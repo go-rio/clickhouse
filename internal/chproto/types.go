@@ -12,153 +12,22 @@ import (
 	"time"
 )
 
-// grow resizes buf to n elements, reallocating only when capacity lacks.
-func grow[T any](buf []T, n int) []T {
-	if cap(buf) < n {
-		buf = make([]T, n)
-	}
-	return buf[:n]
-}
-
-// pow10Units returns the tick size in nanoseconds for a DateTime64 precision.
-func pow10Units(precision int) int64 {
-	unit := int64(1)
-	for i := precision; i < 9; i++ {
-		unit *= 10
-	}
-	return unit
-}
-
-// parseDecimal parses Decimal type strings into wire width and scale.
-// "Decimal(P, S)" sizes by precision; Decimal32/64/128(S) are the aliases.
-func parseDecimal(typ string) (size, scale int, err error) {
-	bad := func() (int, int, error) { return 0, 0, fmt.Errorf("chproto: bad type %q", typ) }
-	switch {
-	case strings.HasPrefix(typ, "Decimal("):
-		inner := strings.TrimSuffix(strings.TrimPrefix(typ, "Decimal("), ")")
-		p, sStr, ok := strings.Cut(inner, ",")
-		if !ok {
-			return bad()
-		}
-		precision, err1 := strconv.Atoi(strings.TrimSpace(p))
-		scale, err2 := strconv.Atoi(strings.TrimSpace(sStr))
-		if err1 != nil || err2 != nil || scale < 0 || scale > precision {
-			return bad()
-		}
-		switch {
-		case precision <= 9:
-			return 4, scale, nil
-		case precision <= 18:
-			return 8, scale, nil
-		case precision <= 38:
-			return 16, scale, nil
-		}
-		return 0, 0, fmt.Errorf("chproto: %s exceeds 38 digits (Decimal256 is not supported)", typ)
-	case strings.HasPrefix(typ, "Decimal32("):
-		size = 4
-	case strings.HasPrefix(typ, "Decimal64("):
-		size = 8
-	case strings.HasPrefix(typ, "Decimal128("):
-		size = 16
-	default:
-		return bad()
-	}
-	open := strings.IndexByte(typ, '(')
-	scale, err = strconv.Atoi(strings.TrimSpace(typ[open+1 : len(typ)-1]))
-	if err != nil || scale < 0 {
-		return bad()
-	}
-	return size, scale, nil
-}
-
-// parseFixedStringN parses "FixedString(n)".
-func parseFixedStringN(typ string) (int, error) {
-	n, err := strconv.Atoi(typ[len("FixedString(") : len(typ)-1])
-	if err != nil || n <= 0 {
-		return 0, fmt.Errorf("chproto: bad type %q", typ)
-	}
-	return n, nil
-}
-
-// fixedWidth reports a type's per-value wire width, or -1 for String.
-func fixedWidth(typ string) (int, error) {
-	switch typ {
-	case "UInt8", "Int8", "Bool":
-		return 1, nil
-	case "UInt16", "Int16", "Date":
-		return 2, nil
-	case "UInt32", "Int32", "Float32", "DateTime", "Date32":
-		return 4, nil
-	case "UInt64", "Int64", "Float64":
-		return 8, nil
-	case "UUID", "Int128", "UInt128":
-		return 16, nil
-	case "IPv6":
-		return 16, nil
-	case "IPv4":
-		return 4, nil
-	case "Nothing":
-		return 1, nil
-	case "String":
-		return -1, nil
-	}
-	switch {
-	case strings.HasPrefix(typ, "DateTime64("):
-		return 8, nil
-	case strings.HasPrefix(typ, "DateTime("):
-		return 4, nil
-	case strings.HasPrefix(typ, "Enum8("):
-		return 1, nil
-	case strings.HasPrefix(typ, "Enum16("):
-		return 2, nil
-	case strings.HasPrefix(typ, "FixedString("):
-		return parseFixedStringN(typ)
-	case strings.HasPrefix(typ, "Decimal"):
-		size, _, err := parseDecimal(typ)
-		return size, err
-	case strings.HasPrefix(typ, "SimpleAggregateFunction("):
-		return fixedWidth(simpleAggInner(typ))
-	}
-	return 0, fmt.Errorf("chproto: unsupported column type %q", typ)
-}
-
-// skipColumnData discards one column's payload without decoding it.
-func skipColumnData(c *Conn, typ string, rows int) error {
-	if inner, ok := strings.CutPrefix(typ, "Nullable("); ok {
-		if err := c.skipN(rows); err != nil { // null mask
-			return err
-		}
-		return skipColumnData(c, inner[:len(inner)-1], rows)
-	}
-	width, err := fixedWidth(typ)
-	if err != nil {
-		return err
-	}
-	if width >= 0 {
-		return c.skipN(rows * width)
-	}
-	for range rows {
-		if err := c.skipString(); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 // Kind is the access class a decoder serves.
 type Kind uint8
 
 const (
-	KindInt Kind = iota
-	KindUint
-	KindFloat
-	KindBool
-	KindBytes // String/FixedString/Enum/UUID — BytesAt borrows until the next read
-	KindTime
+	KindInt   Kind = iota // Int8..Int64: Int64At
+	KindUint              // UInt8..UInt64: Uint64At
+	KindFloat             // Float32/Float64: Float64At
+	KindBool              // Bool: BoolAt
+	KindBytes             // String, FixedString, Enum, UUID, Decimal, Int128, IP: BytesAt
+	KindTime              // Date, Date32, DateTime, DateTime64: TimeAt
 )
 
-// Decoder loads one column per block and serves typed per-row access; row
-// indexes address the current block, and borrowed bytes die at the next read.
+// Decoder loads one column per block and serves typed per-row access. Row
+// indexes address the current block; Kind names the one At accessor that
+// applies (the others panic), and BytesAt borrows memory that dies at the
+// next read.
 type Decoder interface {
 	read(c *Conn, rows int) error
 	Kind() Kind
@@ -169,6 +38,101 @@ type Decoder interface {
 	BoolAt(i int) bool
 	BytesAt(i int) []byte
 	TimeAt(i int) time.Time
+}
+
+// newDecoder builds the decoder for a wire type string.
+func newDecoder(typ string, tz *time.Location) (Decoder, error) {
+	switch typ {
+	case "UInt8":
+		return &fixedInt{size: 1}, nil
+	case "UInt16":
+		return &fixedInt{size: 2}, nil
+	case "UInt32":
+		return &fixedInt{size: 4}, nil
+	case "UInt64":
+		return &fixedInt{size: 8}, nil
+	case "Int8":
+		return &fixedInt{size: 1, signed: true}, nil
+	case "Int16":
+		return &fixedInt{size: 2, signed: true}, nil
+	case "Int32":
+		return &fixedInt{size: 4, signed: true}, nil
+	case "Int64":
+		return &fixedInt{size: 8, signed: true}, nil
+	case "Bool":
+		return &fixedInt{size: 1, isBool: true}, nil
+	case "Float32":
+		return &fixedFloat{}, nil
+	case "Float64":
+		return &fixedFloat{wide: true}, nil
+	case "String":
+		return &strCol{}, nil
+	case "UUID":
+		return &uuidCol{}, nil
+	case "Int128":
+		return &int128Col{signed: true}, nil
+	case "UInt128":
+		return &int128Col{}, nil
+	case "IPv4":
+		return &ipCol{}, nil
+	case "IPv6":
+		return &ipCol{v6: true}, nil
+	case "Nothing":
+		return &nothingCol{}, nil
+	case "Date":
+		return &timeCol{size: 2, dayBased: true}, nil
+	case "Date32":
+		return &timeCol{size: 4, dayBased: true}, nil
+	}
+	switch {
+	case strings.HasPrefix(typ, "Nullable(") && strings.HasSuffix(typ, ")"):
+		inner, err := newDecoder(typ[len("Nullable("):len(typ)-1], tz)
+		if err != nil {
+			return nil, err
+		}
+		return &nullCol{inner: inner}, nil
+	case strings.HasPrefix(typ, "DateTime64("):
+		precision, loc, err := parseDateTime64(typ, tz)
+		if err != nil {
+			return nil, err
+		}
+		return &timeCol{size: 8, unit: pow10Units(precision), loc: loc}, nil
+	case typ == "DateTime" || strings.HasPrefix(typ, "DateTime("):
+		loc := tz
+		if arg := typeArg(typ, "DateTime"); arg != "" {
+			if l, err := time.LoadLocation(arg); err == nil {
+				loc = l
+			}
+		}
+		return &timeCol{size: 4, unit: int64(time.Second), loc: loc}, nil
+	case strings.HasPrefix(typ, "FixedString("):
+		n, err := parseFixedStringN(typ)
+		if err != nil {
+			return nil, err
+		}
+		return &fixedStr{n: n}, nil
+	case strings.HasPrefix(typ, "Enum8("):
+		names, err := parseEnum(typ[len("Enum8(") : len(typ)-1])
+		if err != nil {
+			return nil, err
+		}
+		return &enumCol{size: 1, names: names}, nil
+	case strings.HasPrefix(typ, "Enum16("):
+		names, err := parseEnum(typ[len("Enum16(") : len(typ)-1])
+		if err != nil {
+			return nil, err
+		}
+		return &enumCol{size: 2, names: names}, nil
+	case strings.HasPrefix(typ, "Decimal"):
+		size, scale, err := parseDecimal(typ)
+		if err != nil {
+			return nil, err
+		}
+		return &decimalCol{size: size, scale: scale}, nil
+	case strings.HasPrefix(typ, "SimpleAggregateFunction("):
+		return newDecoder(simpleAggInner(typ), tz)
+	}
+	return nil, fmt.Errorf("chproto: unsupported column type %q (rio's ClickHouse surface covers scalars, strings, enums, UUID, and date/time)", typ)
 }
 
 // base provides accessor stubs; concrete decoders override their class.
@@ -578,99 +542,141 @@ func (d *nullCol) BoolAt(i int) bool      { return d.inner.BoolAt(i) }
 func (d *nullCol) BytesAt(i int) []byte   { return d.inner.BytesAt(i) }
 func (d *nullCol) TimeAt(i int) time.Time { return d.inner.TimeAt(i) }
 
-// newDecoder builds the decoder for a wire type string.
-func newDecoder(typ string, tz *time.Location) (Decoder, error) {
+// --- type-string helpers ---
+
+// grow resizes buf to n elements, reallocating only when capacity lacks.
+func grow[T any](buf []T, n int) []T {
+	if cap(buf) < n {
+		buf = make([]T, n)
+	}
+	return buf[:n]
+}
+
+// pow10Units returns the tick size in nanoseconds for a DateTime64 precision.
+func pow10Units(precision int) int64 {
+	unit := int64(1)
+	for range 9 - precision {
+		unit *= 10
+	}
+	return unit
+}
+
+// parseDecimal parses Decimal type strings into wire width and scale.
+// "Decimal(P, S)" sizes by precision; Decimal32/64/128(S) are the aliases.
+func parseDecimal(typ string) (size, scale int, err error) {
+	bad := func() (int, int, error) { return 0, 0, fmt.Errorf("chproto: bad type %q", typ) }
+	switch {
+	case strings.HasPrefix(typ, "Decimal("):
+		inner := strings.TrimSuffix(strings.TrimPrefix(typ, "Decimal("), ")")
+		p, sStr, ok := strings.Cut(inner, ",")
+		if !ok {
+			return bad()
+		}
+		precision, err1 := strconv.Atoi(strings.TrimSpace(p))
+		scale, err2 := strconv.Atoi(strings.TrimSpace(sStr))
+		parsed := err1 == nil && err2 == nil
+		scaleOK := scale >= 0 && scale <= precision
+		if !parsed || !scaleOK {
+			return bad()
+		}
+		switch {
+		case precision <= 9:
+			return 4, scale, nil
+		case precision <= 18:
+			return 8, scale, nil
+		case precision <= 38:
+			return 16, scale, nil
+		}
+		return 0, 0, fmt.Errorf("chproto: %s exceeds 38 digits (Decimal256 is not supported)", typ)
+	case strings.HasPrefix(typ, "Decimal32("):
+		size = 4
+	case strings.HasPrefix(typ, "Decimal64("):
+		size = 8
+	case strings.HasPrefix(typ, "Decimal128("):
+		size = 16
+	default:
+		return bad()
+	}
+	open := strings.IndexByte(typ, '(')
+	scale, err = strconv.Atoi(strings.TrimSpace(typ[open+1 : len(typ)-1]))
+	if err != nil || scale < 0 {
+		return bad()
+	}
+	return size, scale, nil
+}
+
+// parseFixedStringN parses "FixedString(n)".
+func parseFixedStringN(typ string) (int, error) {
+	n, err := strconv.Atoi(typ[len("FixedString(") : len(typ)-1])
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("chproto: bad type %q", typ)
+	}
+	return n, nil
+}
+
+// fixedWidth reports a type's per-value wire width, or -1 for String.
+func fixedWidth(typ string) (int, error) {
 	switch typ {
-	case "UInt8":
-		return &fixedInt{size: 1}, nil
-	case "UInt16":
-		return &fixedInt{size: 2}, nil
-	case "UInt32":
-		return &fixedInt{size: 4}, nil
-	case "UInt64":
-		return &fixedInt{size: 8}, nil
-	case "Int8":
-		return &fixedInt{size: 1, signed: true}, nil
-	case "Int16":
-		return &fixedInt{size: 2, signed: true}, nil
-	case "Int32":
-		return &fixedInt{size: 4, signed: true}, nil
-	case "Int64":
-		return &fixedInt{size: 8, signed: true}, nil
-	case "Bool":
-		return &fixedInt{size: 1, isBool: true}, nil
-	case "Float32":
-		return &fixedFloat{}, nil
-	case "Float64":
-		return &fixedFloat{wide: true}, nil
-	case "String":
-		return &strCol{}, nil
-	case "UUID":
-		return &uuidCol{}, nil
-	case "Int128":
-		return &int128Col{signed: true}, nil
-	case "UInt128":
-		return &int128Col{}, nil
-	case "IPv4":
-		return &ipCol{}, nil
+	case "UInt8", "Int8", "Bool":
+		return 1, nil
+	case "UInt16", "Int16", "Date":
+		return 2, nil
+	case "UInt32", "Int32", "Float32", "DateTime", "Date32":
+		return 4, nil
+	case "UInt64", "Int64", "Float64":
+		return 8, nil
+	case "UUID", "Int128", "UInt128":
+		return 16, nil
 	case "IPv6":
-		return &ipCol{v6: true}, nil
+		return 16, nil
+	case "IPv4":
+		return 4, nil
 	case "Nothing":
-		return &nothingCol{}, nil
-	case "Date":
-		return &timeCol{size: 2, dayBased: true}, nil
-	case "Date32":
-		return &timeCol{size: 4, dayBased: true}, nil
+		return 1, nil
+	case "String":
+		return -1, nil
 	}
 	switch {
-	case strings.HasPrefix(typ, "Nullable(") && strings.HasSuffix(typ, ")"):
-		inner, err := newDecoder(typ[len("Nullable("):len(typ)-1], tz)
-		if err != nil {
-			return nil, err
-		}
-		return &nullCol{inner: inner}, nil
 	case strings.HasPrefix(typ, "DateTime64("):
-		precision, loc, err := parseDateTime64(typ, tz)
-		if err != nil {
-			return nil, err
-		}
-		return &timeCol{size: 8, unit: pow10Units(precision), loc: loc}, nil
-	case typ == "DateTime" || strings.HasPrefix(typ, "DateTime("):
-		loc := tz
-		if arg := typeArg(typ, "DateTime"); arg != "" {
-			if l, err := time.LoadLocation(arg); err == nil {
-				loc = l
-			}
-		}
-		return &timeCol{size: 4, unit: int64(time.Second), loc: loc}, nil
-	case strings.HasPrefix(typ, "FixedString("):
-		n, err := parseFixedStringN(typ)
-		if err != nil {
-			return nil, err
-		}
-		return &fixedStr{n: n}, nil
+		return 8, nil
+	case strings.HasPrefix(typ, "DateTime("):
+		return 4, nil
 	case strings.HasPrefix(typ, "Enum8("):
-		names, err := parseEnum(typ[len("Enum8(") : len(typ)-1])
-		if err != nil {
-			return nil, err
-		}
-		return &enumCol{size: 1, names: names}, nil
+		return 1, nil
 	case strings.HasPrefix(typ, "Enum16("):
-		names, err := parseEnum(typ[len("Enum16(") : len(typ)-1])
-		if err != nil {
-			return nil, err
-		}
-		return &enumCol{size: 2, names: names}, nil
+		return 2, nil
+	case strings.HasPrefix(typ, "FixedString("):
+		return parseFixedStringN(typ)
 	case strings.HasPrefix(typ, "Decimal"):
-		size, scale, err := parseDecimal(typ)
-		if err != nil {
-			return nil, err
-		}
-		return &decimalCol{size: size, scale: scale}, nil
+		size, _, err := parseDecimal(typ)
+		return size, err
 	case strings.HasPrefix(typ, "SimpleAggregateFunction("):
-		return newDecoder(simpleAggInner(typ), tz)
+		return fixedWidth(simpleAggInner(typ))
 	}
-	return nil, fmt.Errorf("chproto: unsupported column type %q (rio's ClickHouse surface covers scalars, strings, enums, UUID, and date/time)", typ)
+	return 0, fmt.Errorf("chproto: unsupported column type %q", typ)
+}
+
+// skipColumnData discards one column's payload without decoding it.
+func skipColumnData(c *Conn, typ string, rows int) error {
+	if inner, ok := strings.CutPrefix(typ, "Nullable("); ok {
+		if err := c.skipN(rows); err != nil { // null mask
+			return err
+		}
+		return skipColumnData(c, inner[:len(inner)-1], rows)
+	}
+	width, err := fixedWidth(typ)
+	if err != nil {
+		return err
+	}
+	if width >= 0 {
+		return c.skipN(rows * width)
+	}
+	for range rows {
+		if err := c.skipString(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // simpleAggInner unwraps "SimpleAggregateFunction(fn, T)" to T; the wire
@@ -694,7 +700,8 @@ func parseDateTime64(typ string, def *time.Location) (int, *time.Location, error
 	inner := strings.TrimSuffix(strings.TrimPrefix(typ, "DateTime64("), ")")
 	parts := strings.SplitN(inner, ",", 2)
 	precision, err := strconv.Atoi(strings.TrimSpace(parts[0]))
-	if err != nil || precision < 0 || precision > 9 {
+	precisionOK := err == nil && precision >= 0 && precision <= 9
+	if !precisionOK {
 		return 0, nil, fmt.Errorf("chproto: bad type %q", typ)
 	}
 	loc := def
