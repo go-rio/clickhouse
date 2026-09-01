@@ -159,9 +159,9 @@ func appendLiteral(buf []byte, v any) ([]byte, error) {
 	case uint:
 		return strconv.AppendUint(buf, uint64(x), 10), nil
 	case float64:
-		return appendFloat(buf, x)
+		return appendFloat(buf, x, 64)
 	case float32:
-		return appendFloat(buf, float64(x))
+		return appendFloat(buf, float64(x), 32)
 	case bool:
 		if x {
 			return append(buf, "true"...), nil
@@ -180,8 +180,10 @@ func appendLiteral(buf []byte, v any) ([]byte, error) {
 		return strconv.AppendInt(buf, rv.Int(), 10), nil
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
 		return strconv.AppendUint(buf, rv.Uint(), 10), nil
-	case reflect.Float32, reflect.Float64:
-		return appendFloat(buf, rv.Float())
+	case reflect.Float32:
+		return appendFloat(buf, rv.Float(), 32)
+	case reflect.Float64:
+		return appendFloat(buf, rv.Float(), 64)
 	case reflect.Bool:
 		if rv.Bool() {
 			return append(buf, "true"...), nil
@@ -193,11 +195,11 @@ func appendLiteral(buf []byte, v any) ([]byte, error) {
 	return nil, fmt.Errorf("chproto: cannot bind %T", v)
 }
 
-func appendFloat(buf []byte, f float64) ([]byte, error) {
+func appendFloat(buf []byte, f float64, bits int) ([]byte, error) {
 	if math.IsNaN(f) || math.IsInf(f, 0) {
 		return nil, fmt.Errorf("chproto: cannot bind non-finite float %v", f)
 	}
-	return strconv.AppendFloat(buf, f, 'g', -1, 64), nil
+	return strconv.AppendFloat(buf, f, 'g', -1, bits), nil
 }
 
 // appendQuoted writes a single-quoted literal, escaping backslash and quote.

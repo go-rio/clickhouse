@@ -542,6 +542,14 @@ func (e *timeEnc) append(v any) error {
 	} else {
 		n = t.UnixNano() / e.unit
 	}
+	// Date and DateTime are unsigned and narrow; out-of-range instants
+	// (the zero time.Time above all) would otherwise wrap silently.
+	if e.size == 2 && (n < 0 || n > 65535) {
+		return fmt.Errorf("chproto: %v is outside the Date range [1970-01-01, 2149-06-06]", t)
+	}
+	if e.size == 4 && !e.dayBased && (n < 0 || n > math.MaxUint32) {
+		return fmt.Errorf("chproto: %v is outside the DateTime range [1970-01-01, 2106-02-07]", t)
+	}
 	switch e.size {
 	case 8:
 		e.buf = binary.LittleEndian.AppendUint64(e.buf, uint64(n))

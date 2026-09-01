@@ -239,6 +239,27 @@ func TestIdleExpiryRecovers(t *testing.T) {
 	}
 }
 
+func TestConnLifetimeRecovers(t *testing.T) {
+	dsn := os.Getenv("RIO_CLICKHOUSE_DSN")
+	if dsn == "" {
+		t.Skip("RIO_CLICKHOUSE_DSN not set")
+	}
+	db, err := Open(context.Background(), dsn+"?conn_max_lifetime=50ms")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	for round := range 3 {
+		type row struct{ N uint64 }
+		out, err := rio.Raw[row]("SELECT 7 AS n").All(ctx, db)
+		if err != nil || len(out) != 1 || out[0].N != 7 {
+			t.Fatalf("round %d: %v %v", round, out, err)
+		}
+		time.Sleep(80 * time.Millisecond) // past every connection's lifetime
+	}
+}
+
 type ExtType struct {
 	ID     uint64 `rio:",pk,noautoincr"`
 	Amount string // Decimal(18, 4)

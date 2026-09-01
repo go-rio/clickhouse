@@ -55,9 +55,10 @@ type Config struct {
 
 // Conn is one native-protocol connection; not safe for concurrent use.
 type Conn struct {
-	netc net.Conn
-	r    *bufio.Reader
-	w    *bufio.Writer
+	netc     net.Conn
+	r        *bufio.Reader
+	w        *bufio.Writer
+	dialedAt time.Time
 
 	timezone *time.Location
 
@@ -84,9 +85,10 @@ func Dial(ctx context.Context, cfg Config) (*Conn, error) {
 		netc = tc
 	}
 	c := &Conn{
-		netc: netc,
-		r:    bufio.NewReaderSize(netc, 1<<20),
-		w:    bufio.NewWriterSize(netc, 256<<10),
+		netc:     netc,
+		r:        bufio.NewReaderSize(netc, 1<<20),
+		w:        bufio.NewWriterSize(netc, 256<<10),
+		dialedAt: time.Now(),
 	}
 	if err := c.handshake(ctx, cfg); err != nil {
 		netc.Close()
@@ -267,11 +269,6 @@ func (c *Conn) writeUvarint(v uint64) {
 func (c *Conn) writeString(s string) {
 	c.writeUvarint(uint64(len(s)))
 	c.w.WriteString(s)
-}
-
-func (c *Conn) writeBytes(b []byte) {
-	c.writeUvarint(uint64(len(b)))
-	c.w.Write(b)
 }
 
 func (c *Conn) writeByte(b byte) { c.w.WriteByte(b) }

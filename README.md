@@ -47,6 +47,7 @@ events, err := rio.From[Event]().Where("kind = ?", "click").All(ctx, db)
 | `dial_timeout` | connect timeout, e.g. `5s` (default `10s`) |
 | `max_open_conns` | pool size (default 8) |
 | `conn_max_idle_time` | idle connection expiry, e.g. `90s` (default `5m`) |
+| `conn_max_lifetime` | connection age limit (default `1h`) |
 
 Unknown parameters are rejected.
 

@@ -14,15 +14,72 @@ import (
 func pipeConn() (*Conn, net.Conn) {
 	client, server := net.Pipe()
 	return &Conn{
-		netc: client,
-		r:    bufio.NewReader(client),
-		w:    bufio.NewWriter(client),
+		netc:     client,
+		r:        bufio.NewReader(client),
+		w:        bufio.NewWriter(client),
+		dialedAt: time.Now(),
 	}, server
+}
+
+// A connection past maxLife is discarded even when recently used.
+func TestPoolExpiresLifetime(t *testing.T) {
+	p := NewPool(Config{}, 2, time.Minute, 0)
+	c, server := pipeConn()
+	c.dialedAt = time.Now().Add(-2 * time.Hour)
+	p.slots <- struct{}{}
+	p.Release(c)
+
+	closed := make(chan struct{})
+	go func() {
+		var b [1]byte
+		server.Read(b[:])
+		close(closed)
+	}()
+	if _, err := p.Acquire(context.Background()); err == nil {
+		t.Fatal("over-lifetime conn must not be served")
+	}
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("over-lifetime conn was not closed")
+	}
+}
+
+// liveCheck flags a peer-closed TCP connection and passes a healthy one.
+func TestLiveCheckDetectsPeerClose(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		s, _ := ln.Accept()
+		accepted <- s
+	}()
+	client, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server := <-accepted
+
+	if err := liveCheck(client); err != nil {
+		t.Fatalf("healthy connection flagged: %v", err)
+	}
+	server.Close()
+	deadline := time.Now().Add(2 * time.Second)
+	for liveCheck(client) == nil {
+		if time.Now().After(deadline) {
+			t.Fatal("peer close was never detected")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 // An expired idle connection is discarded, not handed out.
 func TestPoolExpiresIdle(t *testing.T) {
-	p := NewPool(Config{}, 2, time.Millisecond)
+	p := NewPool(Config{}, 2, time.Millisecond, 0)
 	c, server := pipeConn()
 	p.slots <- struct{}{} // stand in for the Acquire that produced c
 	p.Release(c)
@@ -48,7 +105,7 @@ func TestPoolExpiresIdle(t *testing.T) {
 
 // A live idle connection within maxIdle is reused.
 func TestPoolReusesFreshIdle(t *testing.T) {
-	p := NewPool(Config{}, 2, time.Minute)
+	p := NewPool(Config{}, 2, time.Minute, 0)
 	c, _ := pipeConn()
 	p.slots <- struct{}{}
 	p.Release(c)

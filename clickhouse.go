@@ -26,8 +26,8 @@ type Exception = chproto.Exception
 
 // Open connects the native channel and verifies it with a ping. The DSN is
 // clickhouse://user:password@host:port/database with optional parameters
-// secure, skip_verify, dial_timeout, max_open_conns, and
-// conn_max_idle_time.
+// secure, skip_verify, dial_timeout, max_open_conns, conn_max_idle_time,
+// and conn_max_lifetime.
 //
 // The returned DB's Unwrap serves a database/sql view over its own
 // connections.
@@ -36,7 +36,7 @@ func Open(ctx context.Context, dsn string, opts ...rio.Option) (*rio.DB, error) 
 	if err != nil {
 		return nil, err
 	}
-	pool := chproto.NewPool(cfg, po.maxOpen, po.maxIdle)
+	pool := chproto.NewPool(cfg, po.maxOpen, po.maxIdle, po.maxLife)
 	if err := pool.Ping(ctx); err != nil {
 		pool.Close()
 		return nil, fmt.Errorf("clickhouse: open: %w", err)
@@ -50,6 +50,7 @@ func Open(ctx context.Context, dsn string, opts ...rio.Option) (*rio.DB, error) 
 type poolOptions struct {
 	maxOpen int
 	maxIdle time.Duration
+	maxLife time.Duration
 }
 
 // parseDSN interprets clickhouse:// URLs.
@@ -101,9 +102,11 @@ func parseDSN(dsn string) (chproto.Config, poolOptions, error) {
 			po.maxOpen, err = strconv.Atoi(val)
 		case "conn_max_idle_time":
 			po.maxIdle, err = time.ParseDuration(val)
+		case "conn_max_lifetime":
+			po.maxLife, err = time.ParseDuration(val)
 		default:
 			return chproto.Config{}, po, fmt.Errorf(
-				"clickhouse: unsupported DSN parameter %q (supported: username, password, database, secure, skip_verify, dial_timeout, max_open_conns, conn_max_idle_time)", key)
+				"clickhouse: unsupported DSN parameter %q (supported: username, password, database, secure, skip_verify, dial_timeout, max_open_conns, conn_max_idle_time, conn_max_lifetime)", key)
 		}
 		if err != nil {
 			return chproto.Config{}, po, fmt.Errorf("clickhouse: bad DSN parameter %s=%q: %w", key, val, err)

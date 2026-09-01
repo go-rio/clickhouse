@@ -18,6 +18,7 @@ func TestInterpolate(t *testing.T) {
 		{"s = ?", []any{`a\b`}, `s = 'a\\b'`},
 		{"b = ?", []any{[]byte{0x68, 0x69}}, "b = 'hi'"},
 		{"f = ?", []any{2.5}, "f = 2.5"},
+		{"f = ?", []any{float32(0.1)}, "f = 0.1"},
 		{"x = ? AND y = ?", []any{true, nil}, "x = true AND y = NULL"},
 		{"t = ?", []any{time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)}, "t = fromUnixTimestamp64Micro(1788256800000000, 'UTC')"},
 		// quoting contexts keep their question marks

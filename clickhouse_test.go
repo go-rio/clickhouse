@@ -7,14 +7,14 @@ import (
 )
 
 func TestParseDSN(t *testing.T) {
-	cfg, po, err := parseDSN("clickhouse://rio:secret@ch.example:19000/analytics?dial_timeout=3s&max_open_conns=4&conn_max_idle_time=90s")
+	cfg, po, err := parseDSN("clickhouse://rio:secret@ch.example:19000/analytics?dial_timeout=3s&max_open_conns=4&conn_max_idle_time=90s&conn_max_lifetime=30m")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if cfg.Addr != "ch.example:19000" || cfg.User != "rio" || cfg.Password != "secret" || cfg.Database != "analytics" {
 		t.Fatalf("cfg = %+v", cfg)
 	}
-	if cfg.Timeout != 3*time.Second || po.maxOpen != 4 || po.maxIdle != 90*time.Second || cfg.TLS != nil {
+	if cfg.Timeout != 3*time.Second || po.maxOpen != 4 || po.maxIdle != 90*time.Second || po.maxLife != 30*time.Minute || cfg.TLS != nil {
 		t.Fatalf("timeout=%v pool=%+v tls=%v", cfg.Timeout, po, cfg.TLS)
 	}
 }

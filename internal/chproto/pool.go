@@ -11,10 +11,12 @@ import (
 var ErrPoolClosed = errors.New("chproto: pool is closed")
 
 // Pool hands out connections one query at a time. Broken connections are
-// discarded on release; idle ones expire after maxIdle.
+// discarded on release; idle ones expire after maxIdle, every connection
+// after maxLife.
 type Pool struct {
 	cfg     Config
 	maxIdle time.Duration
+	maxLife time.Duration
 	slots   chan struct{} // capacity = max open
 
 	mu     sync.Mutex
@@ -28,18 +30,22 @@ type idleConn struct {
 }
 
 // NewPool creates a pool of at most maxOpen connections that dial lazily.
-// maxOpen defaults to 8, maxIdle to five minutes.
-func NewPool(cfg Config, maxOpen int, maxIdle time.Duration) *Pool {
+// maxOpen defaults to 8, maxIdle to five minutes, maxLife to one hour.
+func NewPool(cfg Config, maxOpen int, maxIdle, maxLife time.Duration) *Pool {
 	if maxOpen <= 0 {
 		maxOpen = 8
 	}
 	if maxIdle <= 0 {
 		maxIdle = 5 * time.Minute
 	}
-	return &Pool{cfg: cfg, maxIdle: maxIdle, slots: make(chan struct{}, maxOpen)}
+	if maxLife <= 0 {
+		maxLife = time.Hour
+	}
+	return &Pool{cfg: cfg, maxIdle: maxIdle, maxLife: maxLife, slots: make(chan struct{}, maxOpen)}
 }
 
 // Acquire returns a connection, dialing when no live idle one exists.
+// Idle candidates are probed for a peer close before reuse.
 func (p *Pool) Acquire(ctx context.Context) (*Conn, error) {
 	select {
 	case p.slots <- struct{}{}:
@@ -47,27 +53,34 @@ func (p *Pool) Acquire(ctx context.Context) (*Conn, error) {
 		return nil, ctx.Err()
 	}
 	now := time.Now()
-	p.mu.Lock()
-	if p.closed {
+	for {
+		p.mu.Lock()
+		if p.closed {
+			p.mu.Unlock()
+			<-p.slots
+			return nil, ErrPoolClosed
+		}
+		var expired []*Conn
+		for len(p.idle) > 0 && now.Sub(p.idle[0].since) > p.maxIdle {
+			expired = append(expired, p.idle[0].c)
+			p.idle = p.idle[1:]
+		}
+		var c *Conn
+		if n := len(p.idle); n > 0 {
+			c = p.idle[n-1].c
+			p.idle = p.idle[:n-1]
+		}
 		p.mu.Unlock()
-		<-p.slots
-		return nil, ErrPoolClosed
-	}
-	var expired []*Conn
-	for len(p.idle) > 0 && now.Sub(p.idle[0].since) > p.maxIdle {
-		expired = append(expired, p.idle[0].c)
-		p.idle = p.idle[1:]
-	}
-	var c *Conn
-	if n := len(p.idle); n > 0 {
-		c = p.idle[n-1].c
-		p.idle = p.idle[:n-1]
-	}
-	p.mu.Unlock()
-	for _, e := range expired {
-		e.Close()
-	}
-	if c != nil {
+		for _, e := range expired {
+			e.Close()
+		}
+		if c == nil {
+			break
+		}
+		if now.Sub(c.dialedAt) >= p.maxLife || liveCheck(c.netc) != nil {
+			c.Close()
+			continue
+		}
 		return c, nil
 	}
 	c, err := Dial(ctx, p.cfg)
