@@ -524,7 +524,6 @@ func unhex(c byte) (byte, bool) {
 
 func (e *uuidEnc) appendZero() { e.pad(16) }
 
-// timeEnc accepts time.Time values and TimeFormat-shaped text.
 type timeEnc struct {
 	bufEnc
 	size     int
@@ -533,16 +532,8 @@ type timeEnc struct {
 }
 
 func (e *timeEnc) append(v any) error {
-	var t time.Time
-	switch x := v.(type) {
-	case time.Time:
-		t = x
-	case string:
-		var ok bool
-		if t, ok = parseTimeText(x); !ok {
-			return fmt.Errorf("cannot bind %q as a time", x)
-		}
-	default:
+	t, ok := v.(time.Time)
+	if !ok {
 		return fmt.Errorf("cannot bind %T as a time", v)
 	}
 	var n int64
@@ -563,46 +554,6 @@ func (e *timeEnc) append(v any) error {
 }
 
 func (e *timeEnc) appendZero() { e.pad(e.size) }
-
-// parseTimeText decodes TimeFormat-shaped text positionally.
-func parseTimeText(s string) (time.Time, bool) {
-	if len(s) != 32 || s[4] != '-' || s[7] != '-' || s[10] != ' ' ||
-		s[13] != ':' || s[16] != ':' || s[19] != '.' || s[29] != ':' ||
-		(s[26] != '+' && s[26] != '-') {
-		return time.Time{}, false
-	}
-	num := func(from, to int) (n int, ok bool) {
-		for i := from; i < to; i++ {
-			d := s[i] - '0'
-			if d > 9 {
-				return 0, false
-			}
-			n = n*10 + int(d)
-		}
-		return n, true
-	}
-	year, ok1 := num(0, 4)
-	month, ok2 := num(5, 7)
-	day, ok3 := num(8, 10)
-	hour, ok4 := num(11, 13)
-	minute, ok5 := num(14, 16)
-	sec, ok6 := num(17, 19)
-	micro, ok7 := num(20, 26)
-	offH, ok8 := num(27, 29)
-	offM, ok9 := num(30, 32)
-	if !(ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9) {
-		return time.Time{}, false
-	}
-	loc := time.UTC
-	if offH|offM != 0 {
-		offset := (offH*60 + offM) * 60
-		if s[26] == '-' {
-			offset = -offset
-		}
-		loc = time.FixedZone("", offset)
-	}
-	return time.Date(year, time.Month(month), day, hour, minute, sec, micro*1000, loc), true
-}
 
 // decimalEnc encodes Decimal columns from decimal text or numeric bindings
 // into scaled little-endian integers.

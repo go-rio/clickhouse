@@ -10,10 +10,6 @@ import (
 	"time"
 )
 
-// TimeFormat is rio's ClickHouse time binding layout; interpolated literals
-// and the copy path's text parsing share it.
-const TimeFormat = "2006-01-02 15:04:05.000000+00:00"
-
 // Interpolate substitutes ? placeholders with SQL literals, honoring
 // ClickHouse quoting: '...' strings (with \ escapes), `...` and "..."
 // identifiers, -- and /* */ comments, and the \? literal-question escape.
@@ -172,7 +168,11 @@ func appendLiteral(buf []byte, v any) ([]byte, error) {
 		}
 		return append(buf, "false"...), nil
 	case time.Time:
-		return appendQuoted(buf, x.UTC().Format(TimeFormat)), nil
+		// Epoch-microsecond function form: the primary-key range analyzer
+		// rejects offset-carrying text literals.
+		buf = append(buf, "fromUnixTimestamp64Micro("...)
+		buf = strconv.AppendInt(buf, x.UnixMicro(), 10)
+		return append(buf, ", 'UTC')"...), nil
 	}
 	rv := reflect.ValueOf(v)
 	switch rv.Kind() {

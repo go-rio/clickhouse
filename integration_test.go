@@ -298,6 +298,51 @@ func TestExtendedTypesRoundTrip(t *testing.T) {
 	}
 }
 
+type TimeKeyed struct {
+	ID uint64 `rio:",pk,noautoincr"`
+	At time.Time
+}
+
+// Sorting-key time columns route range predicates through the primary-key
+// analyzer, whose constant parser is stricter than ordinary comparisons.
+func TestTimePredicateOnSortingKey(t *testing.T) {
+	ctx := context.Background()
+	db := openTest(t)
+	if _, err := rio.Exec(ctx, db, "DROP TABLE IF EXISTS time_keyeds"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rio.Exec(ctx, db, `CREATE TABLE time_keyeds (
+		id UInt64, at DateTime64(3, 'UTC'),
+		created_at DateTime64(6, 'UTC'), updated_at DateTime64(6, 'UTC')
+	) ENGINE = MergeTree() ORDER BY at`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = rio.Exec(ctx, db, "DROP TABLE IF EXISTS time_keyeds") })
+
+	base := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	rows := []TimeKeyed{
+		{ID: 1, At: time.Date(1969, 6, 1, 0, 0, 0, 0, time.UTC)},
+		{ID: 2, At: base},
+		{ID: 3, At: base.Add(90 * time.Minute)},
+	}
+	if err := rio.InsertAll(ctx, db, rows); err != nil {
+		t.Fatalf("InsertAll: %v", err)
+	}
+
+	got, err := rio.From[TimeKeyed]().Where("at >= ?", base).OrderBy("at").All(ctx, db)
+	if err != nil {
+		t.Fatalf("range over sorting key: %v", err)
+	}
+	if len(got) != 2 || !got[0].At.Equal(base) || got[1].ID != 3 {
+		t.Fatalf("rows drifted: %+v", got)
+	}
+	// Pre-epoch bound plus a half-open window, still through the analyzer.
+	n, err := rio.From[TimeKeyed]().Where("at >= ? AND at < ?", rows[0].At.Add(-time.Hour), base).Count(ctx, db)
+	if err != nil || n != 1 {
+		t.Fatalf("pre-epoch window: %d %v", n, err)
+	}
+}
+
 // SELECT NULL produces a Nullable(Nothing) column; scanning it into a
 // pointer must yield nil, not an unsupported-type error.
 func TestSelectNullLiteral(t *testing.T) {
