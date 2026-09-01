@@ -1,38 +1,123 @@
-// Package clickhouse connects rio to ClickHouse through clickhouse-go v2's
-// database/sql driver.
+// Package clickhouse connects rio to ClickHouse over its native TCP
+// protocol, implemented in-repo with no third-party dependencies.
 //
-// ClickHouse 26.7 or newer is required for rio's offset-carrying time values.
-// No constraint-error translator is installed (ClickHouse has no unique or
-// foreign key constraints); server errors remain reachable as
+// ClickHouse 26.7 or newer is required for rio's offset-carrying time
+// values. No constraint-error translator is installed (ClickHouse has no
+// unique or foreign key constraints); server errors remain reachable as
 // *clickhouse.Exception through errors.As.
 package clickhouse
 
 import (
-	"database/sql"
+	"context"
+	"crypto/tls"
 	"fmt"
+	"net"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
 
-	"github.com/ClickHouse/clickhouse-go/v2"
+	"github.com/go-rio/clickhouse/internal/chproto"
 	"github.com/go-rio/rio"
 )
 
-const driverName = "clickhouse"
+// Exception is a ClickHouse server error.
+type Exception = chproto.Exception
 
-// Open validates a ClickHouse DSN and wraps the resulting database/sql pool.
-// The DSN passes through unchanged; it does not connect (ping via
-// db.Unwrap().PingContext).
-func Open(dsn string, opts ...rio.Option) (*rio.DB, error) {
-	if _, err := clickhouse.ParseDSN(dsn); err != nil {
-		return nil, fmt.Errorf("clickhouse: open: %w", err)
-	}
-	db, err := sql.Open(driverName, dsn)
+// Open connects the native channel and verifies it with a ping. The DSN is
+// clickhouse://user:password@host:port/database with optional parameters
+// secure, skip_verify, dial_timeout, and max_open_conns.
+//
+// The returned DB's Unwrap serves a database/sql view over its own
+// connections (what go-rio/migrate consumes); rio itself executes on the
+// protocol directly.
+func Open(ctx context.Context, dsn string, opts ...rio.Option) (*rio.DB, error) {
+	cfg, maxOpen, err := parseDSN(dsn)
 	if err != nil {
+		return nil, err
+	}
+	pool := chproto.NewPool(cfg, maxOpen)
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
 		return nil, fmt.Errorf("clickhouse: open: %w", err)
 	}
-	return New(db, opts...), nil
+	view, err := OpenSQL(dsn)
+	if err != nil {
+		pool.Close()
+		return nil, err
+	}
+	nd := &nativeDB{pool: pool}
+	return rio.NewNative(rio.NativeConfig{DB: nd, Handle: pool, SQLView: view}, rio.ClickHouse, opts...), nil
 }
 
-// New wraps an existing *sql.DB with the ClickHouse dialect. It installs no
-// constraint-error translator; see the package documentation.
-func New(db *sql.DB, opts ...rio.Option) *rio.DB {
-	return rio.New(db, rio.ClickHouse, opts...)
+// parseDSN interprets clickhouse:// URLs.
+func parseDSN(dsn string) (chproto.Config, int, error) {
+	u, err := url.Parse(dsn)
+	if err != nil {
+		return chproto.Config{}, 0, fmt.Errorf("clickhouse: bad DSN: %w", err)
+	}
+	if u.Scheme != "clickhouse" {
+		return chproto.Config{}, 0, fmt.Errorf("clickhouse: bad DSN scheme %q (want clickhouse://)", u.Scheme)
+	}
+	cfg := chproto.Config{
+		Addr:     u.Host,
+		Database: strings.TrimPrefix(u.Path, "/"),
+		Timeout:  10 * time.Second,
+	}
+	if cfg.Database == "" {
+		cfg.Database = "default"
+	}
+	if u.User != nil {
+		cfg.User = u.User.Username()
+		cfg.Password, _ = u.User.Password()
+	}
+	if cfg.User == "" {
+		cfg.User = "default"
+	}
+	if _, _, err := net.SplitHostPort(u.Host); err != nil {
+		cfg.Addr = net.JoinHostPort(u.Host, "9000")
+	}
+	maxOpen := 0
+	var secure, skipVerify bool
+	for key, vals := range u.Query() {
+		val := vals[len(vals)-1]
+		var err error
+		switch key {
+		case "username":
+			cfg.User = val
+		case "password":
+			cfg.Password = val
+		case "database":
+			cfg.Database = val
+		case "secure":
+			secure, err = parseDSNBool(val)
+		case "skip_verify":
+			skipVerify, err = parseDSNBool(val)
+		case "dial_timeout":
+			cfg.Timeout, err = time.ParseDuration(val)
+		case "max_open_conns":
+			maxOpen, err = strconv.Atoi(val)
+		default:
+			return chproto.Config{}, 0, fmt.Errorf(
+				"clickhouse: unsupported DSN parameter %q (supported: username, password, database, secure, skip_verify, dial_timeout, max_open_conns)", key)
+		}
+		if err != nil {
+			return chproto.Config{}, 0, fmt.Errorf("clickhouse: bad DSN parameter %s=%q: %w", key, val, err)
+		}
+	}
+	if secure {
+		host, _, _ := net.SplitHostPort(cfg.Addr)
+		cfg.TLS = &tls.Config{ServerName: host, InsecureSkipVerify: skipVerify}
+	}
+	return cfg, maxOpen, nil
+}
+
+func parseDSNBool(v string) (bool, error) {
+	switch v {
+	case "true", "1":
+		return true, nil
+	case "false", "0":
+		return false, nil
+	}
+	return false, fmt.Errorf("want true or false")
 }
