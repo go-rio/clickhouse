@@ -5,6 +5,16 @@ import (
 	"fmt"
 )
 
+// SendError marks a failure while transmitting a query, before the server
+// can have acted on it — the one window where retrying on a fresh
+// connection is always safe.
+type SendError struct {
+	Err error
+}
+
+func (e *SendError) Error() string { return e.Err.Error() }
+func (e *SendError) Unwrap() error { return e.Err }
+
 // Exception is a server-reported error.
 type Exception struct {
 	Code    int32
@@ -274,7 +284,7 @@ func (c *Conn) readMetaColumns() ([]Column, error) {
 func (c *Conn) Query(ctx context.Context, query string) (*Rows, error) {
 	c.applyDeadline(ctx)
 	if err := c.sendQuery(query); err != nil {
-		return nil, c.fail(err)
+		return nil, c.fail(&SendError{Err: err})
 	}
 	if c.rows == nil {
 		c.rows = &Rows{conn: c}

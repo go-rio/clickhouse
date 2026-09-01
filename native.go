@@ -16,18 +16,37 @@ type nativeDB struct {
 	pool *chproto.Pool
 }
 
+// acquire hands do a pooled connection, redialing once when transmission
+// itself failed — a stale idle connection the server closed surfaces there,
+// before the query can have run.
+func (d *nativeDB) acquire(ctx context.Context, do func(*chproto.Conn) error) (*chproto.Conn, error) {
+	for attempt := 0; ; attempt++ {
+		c, err := d.pool.Acquire(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if err = do(c); err == nil {
+			return c, nil
+		}
+		d.pool.Release(c)
+		var send *chproto.SendError
+		if attempt > 0 || !errors.As(err, &send) {
+			return nil, err
+		}
+	}
+}
+
 func (d *nativeDB) Query(ctx context.Context, sqlText string, args []any) (rio.NativeRows, error) {
 	q, err := chproto.Interpolate(sqlText, args)
 	if err != nil {
 		return nil, err
 	}
-	c, err := d.pool.Acquire(ctx)
+	var rows *chproto.Rows
+	c, err := d.acquire(ctx, func(c *chproto.Conn) (err error) {
+		rows, err = c.Query(ctx, q)
+		return err
+	})
 	if err != nil {
-		return nil, err
-	}
-	rows, err := c.Query(ctx, q)
-	if err != nil {
-		d.pool.Release(c)
 		return nil, err
 	}
 	return &nativeRows{pool: d.pool, conn: c, rows: rows}, nil
@@ -38,15 +57,16 @@ func (d *nativeDB) Exec(ctx context.Context, sqlText string, args []any) (int64,
 	if err != nil {
 		return 0, err
 	}
-	c, err := d.pool.Acquire(ctx)
+	c, err := d.acquire(ctx, func(c *chproto.Conn) error {
+		return c.Exec(ctx, q)
+	})
 	if err != nil {
 		return 0, err
 	}
-	err = c.Exec(ctx, q)
 	d.pool.Release(c)
 	// ClickHouse reports no affected-row counts; rio's dialect rejects every
 	// API whose contract needs one.
-	return 0, err
+	return 0, nil
 }
 
 func (d *nativeDB) Begin(context.Context, *sql.TxOptions) (rio.NativeTx, error) {
@@ -76,15 +96,15 @@ func (d *nativeDB) CopyIn(ctx context.Context, table []string, columns []string,
 	}
 	b.WriteString(") VALUES")
 
-	c, err := d.pool.Acquire(ctx)
+	var in *chproto.Insert
+	c, err := d.acquire(ctx, func(c *chproto.Conn) (err error) {
+		in, err = c.BeginInsert(ctx, b.String())
+		return err
+	})
 	if err != nil {
 		return 0, err
 	}
 	defer d.pool.Release(c)
-	in, err := c.BeginInsert(ctx, b.String())
-	if err != nil {
-		return 0, err
-	}
 	// An abandoned stream cannot leave a reusable connection behind.
 	committed := false
 	defer func() {

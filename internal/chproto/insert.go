@@ -5,6 +5,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"math/bits"
+	"net/netip"
 	"reflect"
 	"strings"
 	"time"
@@ -37,7 +39,7 @@ type Insert struct {
 func (c *Conn) BeginInsert(ctx context.Context, query string) (*Insert, error) {
 	c.applyDeadline(ctx)
 	if err := c.sendQuery(query); err != nil {
-		return nil, c.fail(err)
+		return nil, c.fail(&SendError{Err: err})
 	}
 	for {
 		pt, err := c.nextPacket()
@@ -238,6 +240,12 @@ func newEncoder(typ string) (encoder, error) {
 		return &strEnc{}, nil
 	case "UUID":
 		return &uuidEnc{}, nil
+	case "Int128", "UInt128":
+		return &int128Enc{}, nil
+	case "IPv4":
+		return &ipEnc{}, nil
+	case "IPv6":
+		return &ipEnc{v6: true}, nil
 	case "Date":
 		return &timeEnc{size: 2, dayBased: true}, nil
 	case "Date32":
@@ -276,6 +284,14 @@ func newEncoder(typ string) (encoder, error) {
 			return nil, err
 		}
 		return &enumEnc{size: 2, vals: vals}, nil
+	case strings.HasPrefix(typ, "Decimal"):
+		size, scale, err := parseDecimal(typ)
+		if err != nil {
+			return nil, err
+		}
+		return &decimalEnc{size: size, scale: scale}, nil
+	case strings.HasPrefix(typ, "SimpleAggregateFunction("):
+		return newEncoder(simpleAggInner(typ))
 	}
 	return nil, fmt.Errorf("chproto: unsupported insert column type %q", typ)
 }
@@ -352,22 +368,12 @@ type floatEnc struct {
 }
 
 func (e *floatEnc) append(v any) error {
-	var f float64
-	switch n := v.(type) {
-	case float64:
-		f = n
-	case float32:
-		f = float64(n)
-	default:
-		if i, ok := asInt64(v); ok {
+	f, ok := asFloat64(v)
+	if !ok {
+		if i, iok := asInt64(v); iok {
 			f = float64(i)
 		} else {
-			rv := reflect.ValueOf(v)
-			if rv.Kind() == reflect.Float32 || rv.Kind() == reflect.Float64 {
-				f = rv.Float()
-			} else {
-				return fmt.Errorf("cannot bind %T as a float", v)
-			}
+			return fmt.Errorf("cannot bind %T as a float", v)
 		}
 	}
 	if e.wide {
@@ -612,6 +618,221 @@ func parseTimeText(s string) (time.Time, bool) {
 		loc = time.FixedZone("", offset)
 	}
 	return time.Date(year, time.Month(month), day, hour, minute, sec, micro*1000, loc), true
+}
+
+// decimalEnc encodes Decimal columns from decimal text or numeric bindings
+// into scaled little-endian integers.
+type decimalEnc struct {
+	bufEnc
+	size  int
+	scale int
+}
+
+func (e *decimalEnc) append(v any) error {
+	var hi, lo uint64
+	var neg bool
+	switch {
+	case isStringLike(v):
+		s, _ := asString(v)
+		var err error
+		if hi, lo, neg, err = parseDecimalText(s, e.scale); err != nil {
+			return err
+		}
+	default:
+		if f, ok := asFloat64(v); ok {
+			scaled := math.Round(f * math.Pow10(e.scale))
+			if math.Abs(scaled) >= 9.2e18 {
+				return fmt.Errorf("decimal value %v overflows the float64-bound path; bind it as a string", v)
+			}
+			n := int64(scaled)
+			lo = uint64(n)
+			hi = uint64(n >> 63)
+			neg = n < 0
+			if neg {
+				lo = ^lo + 1
+				hi = ^hi
+				if lo == 0 {
+					hi++
+				}
+				neg = false // already two's complement
+			}
+		} else if n, ok := asInt64(v); ok {
+			for range e.scale {
+				n *= 10
+			}
+			lo = uint64(n)
+			hi = uint64(n >> 63)
+		} else {
+			return fmt.Errorf("cannot bind %T as a decimal", v)
+		}
+	}
+	if neg { // two's complement of the parsed magnitude
+		lo = ^lo + 1
+		hi = ^hi
+		if lo == 0 {
+			hi++
+		}
+	}
+	switch e.size {
+	case 4:
+		e.buf = binary.LittleEndian.AppendUint32(e.buf, uint32(lo))
+	case 8:
+		e.buf = binary.LittleEndian.AppendUint64(e.buf, lo)
+	default:
+		e.buf = binary.LittleEndian.AppendUint64(e.buf, lo)
+		e.buf = binary.LittleEndian.AppendUint64(e.buf, hi)
+	}
+	return nil
+}
+
+func (e *decimalEnc) appendZero() { e.pad(e.size) }
+
+func isStringLike(v any) bool {
+	switch v.(type) {
+	case string, []byte:
+		return true
+	}
+	return reflect.ValueOf(v).Kind() == reflect.String
+}
+
+func asFloat64(v any) (float64, bool) {
+	switch f := v.(type) {
+	case float64:
+		return f, true
+	case float32:
+		return float64(f), true
+	}
+	if rv := reflect.ValueOf(v); rv.Kind() == reflect.Float32 || rv.Kind() == reflect.Float64 {
+		return rv.Float(), true
+	}
+	return 0, false
+}
+
+// parseDecimalText converts "-123.45" into a 128-bit magnitude scaled to
+// exactly scale fractional digits.
+func parseDecimalText(s string, scale int) (hi, lo uint64, neg bool, err error) {
+	bad := func() (uint64, uint64, bool, error) {
+		return 0, 0, false, fmt.Errorf("cannot bind %q as a decimal", s)
+	}
+	rest := s
+	if len(rest) > 0 && (rest[0] == '-' || rest[0] == '+') {
+		neg = rest[0] == '-'
+		rest = rest[1:]
+	}
+	intPart, fracPart, hasDot := strings.Cut(rest, ".")
+	if intPart == "" && fracPart == "" {
+		return bad()
+	}
+	if hasDot && len(fracPart) > scale {
+		return 0, 0, false, fmt.Errorf("%q has more than %d fractional digits", s, scale)
+	}
+	mulAdd := func(d byte) bool { // ×10 + d, reporting overflow
+		var carry uint64
+		hh, hl := bits.Mul64(hi, 10)
+		lh, ll := bits.Mul64(lo, 10)
+		if hh != 0 {
+			return false
+		}
+		lo, carry = bits.Add64(ll, uint64(d), 0)
+		hi, carry = bits.Add64(hl+lh, 0, carry)
+		return carry == 0 && hl+lh >= hl
+	}
+	digits := 0
+	for i := 0; i < len(intPart); i++ {
+		d := intPart[i] - '0'
+		if d > 9 {
+			return bad()
+		}
+		if !mulAdd(d) {
+			return bad()
+		}
+		digits++
+	}
+	for i := 0; i < scale; i++ {
+		var d byte
+		if i < len(fracPart) {
+			d = fracPart[i] - '0'
+			if d > 9 {
+				return bad()
+			}
+		}
+		if !mulAdd(d) {
+			return bad()
+		}
+	}
+	if digits == 0 && !hasDot {
+		return bad()
+	}
+	return hi, lo, neg, nil
+}
+
+// int128Enc encodes Int128/UInt128 from decimal text or integer bindings.
+type int128Enc struct {
+	bufEnc
+}
+
+func (e *int128Enc) append(v any) error {
+	var hi, lo uint64
+	if s, ok := asString(v); ok {
+		var neg bool
+		var err error
+		if hi, lo, neg, err = parseDecimalText(s, 0); err != nil {
+			return err
+		}
+		if neg {
+			lo = ^lo + 1
+			hi = ^hi
+			if lo == 0 {
+				hi++
+			}
+		}
+	} else if n, ok := asInt64(v); ok {
+		lo = uint64(n)
+		hi = uint64(n >> 63)
+	} else {
+		return fmt.Errorf("cannot bind %T as a 128-bit integer", v)
+	}
+	e.buf = binary.LittleEndian.AppendUint64(e.buf, lo)
+	e.buf = binary.LittleEndian.AppendUint64(e.buf, hi)
+	return nil
+}
+
+func (e *int128Enc) appendZero() { e.pad(16) }
+
+// ipEnc encodes IPv4/IPv6 from address text.
+type ipEnc struct {
+	bufEnc
+	v6 bool
+}
+
+func (e *ipEnc) append(v any) error {
+	s, ok := asString(v)
+	if !ok {
+		return fmt.Errorf("cannot bind %T as an IP address", v)
+	}
+	addr, err := netip.ParseAddr(s)
+	if err != nil {
+		return err
+	}
+	if e.v6 {
+		b := addr.As16()
+		e.buf = append(e.buf, b[:]...)
+		return nil
+	}
+	if !addr.Is4() {
+		return fmt.Errorf("cannot bind %q into an IPv4 column", s)
+	}
+	b := addr.As4()
+	e.buf = binary.LittleEndian.AppendUint32(e.buf, uint32(b[0])<<24|uint32(b[1])<<16|uint32(b[2])<<8|uint32(b[3]))
+	return nil
+}
+
+func (e *ipEnc) appendZero() {
+	if e.v6 {
+		e.pad(16)
+	} else {
+		e.pad(4)
+	}
 }
 
 type nullEnc struct {

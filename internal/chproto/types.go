@@ -4,6 +4,9 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"math/bits"
+	"net/netip"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -26,6 +29,48 @@ func pow10Units(precision int) int64 {
 	return unit
 }
 
+// parseDecimal parses Decimal type strings into wire width and scale.
+// "Decimal(P, S)" sizes by precision; Decimal32/64/128(S) are the aliases.
+func parseDecimal(typ string) (size, scale int, err error) {
+	bad := func() (int, int, error) { return 0, 0, fmt.Errorf("chproto: bad type %q", typ) }
+	switch {
+	case strings.HasPrefix(typ, "Decimal("):
+		inner := strings.TrimSuffix(strings.TrimPrefix(typ, "Decimal("), ")")
+		p, sStr, ok := strings.Cut(inner, ",")
+		if !ok {
+			return bad()
+		}
+		precision, err1 := strconv.Atoi(strings.TrimSpace(p))
+		scale, err2 := strconv.Atoi(strings.TrimSpace(sStr))
+		if err1 != nil || err2 != nil || scale < 0 || scale > precision {
+			return bad()
+		}
+		switch {
+		case precision <= 9:
+			return 4, scale, nil
+		case precision <= 18:
+			return 8, scale, nil
+		case precision <= 38:
+			return 16, scale, nil
+		}
+		return 0, 0, fmt.Errorf("chproto: %s exceeds 38 digits (Decimal256 is not supported)", typ)
+	case strings.HasPrefix(typ, "Decimal32("):
+		size = 4
+	case strings.HasPrefix(typ, "Decimal64("):
+		size = 8
+	case strings.HasPrefix(typ, "Decimal128("):
+		size = 16
+	default:
+		return bad()
+	}
+	open := strings.IndexByte(typ, '(')
+	scale, err = strconv.Atoi(strings.TrimSpace(typ[open+1 : len(typ)-1]))
+	if err != nil || scale < 0 {
+		return bad()
+	}
+	return size, scale, nil
+}
+
 // parseFixedStringN parses "FixedString(n)".
 func parseFixedStringN(typ string) (int, error) {
 	n, err := strconv.Atoi(typ[len("FixedString(") : len(typ)-1])
@@ -46,8 +91,14 @@ func fixedWidth(typ string) (int, error) {
 		return 4, nil
 	case "UInt64", "Int64", "Float64":
 		return 8, nil
-	case "UUID":
+	case "UUID", "Int128", "UInt128":
 		return 16, nil
+	case "IPv6":
+		return 16, nil
+	case "IPv4":
+		return 4, nil
+	case "Nothing":
+		return 1, nil
 	case "String":
 		return -1, nil
 	}
@@ -62,6 +113,11 @@ func fixedWidth(typ string) (int, error) {
 		return 2, nil
 	case strings.HasPrefix(typ, "FixedString("):
 		return parseFixedStringN(typ)
+	case strings.HasPrefix(typ, "Decimal"):
+		size, _, err := parseDecimal(typ)
+		return size, err
+	case strings.HasPrefix(typ, "SimpleAggregateFunction("):
+		return fixedWidth(simpleAggInner(typ))
 	}
 	return 0, fmt.Errorf("chproto: unsupported column type %q", typ)
 }
@@ -352,6 +408,153 @@ func (d *timeCol) TimeAt(i int) time.Time {
 	return time.Unix(0, v*d.unit).In(d.loc)
 }
 
+// decimalCol decodes Decimal columns — scaled little-endian integers of 4,
+// 8, or 16 bytes — into fixed-scale decimal text.
+type decimalCol struct {
+	base
+	size  int
+	scale int
+	buf   []byte
+	txt   []byte
+}
+
+func (d *decimalCol) read(c *Conn, rows int) error {
+	d.buf = grow(d.buf, rows*d.size)
+	return c.readFull(d.buf)
+}
+
+func (d *decimalCol) Kind() Kind { return KindBytes }
+
+func (d *decimalCol) BytesAt(i int) []byte {
+	var hi, lo uint64
+	switch d.size {
+	case 4:
+		v := int64(int32(binary.LittleEndian.Uint32(d.buf[i*4:])))
+		lo = uint64(v)
+		hi = uint64(v >> 63)
+	case 8:
+		v := int64(binary.LittleEndian.Uint64(d.buf[i*8:]))
+		lo = uint64(v)
+		hi = uint64(v >> 63)
+	default:
+		lo = binary.LittleEndian.Uint64(d.buf[i*16:])
+		hi = binary.LittleEndian.Uint64(d.buf[i*16+8:])
+	}
+	neg := int64(hi) < 0
+	if neg {
+		lo = ^lo + 1
+		hi = ^hi
+		if lo == 0 {
+			hi++
+		}
+	}
+	// format the unsigned 128-bit value in reverse, then point at the front
+	d.txt = d.txt[:0]
+	digits := 0
+	for hi != 0 || lo != 0 || digits <= d.scale {
+		var rem uint64
+		hi, rem = hi/10, hi%10
+		lo, rem = bits.Div64(rem, lo, 10)
+		d.txt = append(d.txt, byte('0'+rem))
+		digits++
+		if digits == d.scale && d.scale > 0 {
+			d.txt = append(d.txt, '.')
+		}
+	}
+	if neg {
+		d.txt = append(d.txt, '-')
+	}
+	slices.Reverse(d.txt)
+	return d.txt
+}
+
+// int128Col decodes Int128/UInt128 into decimal text (Go has no native
+// 128-bit integer; string fields carry them exactly).
+type int128Col struct {
+	base
+	signed bool
+	buf    []byte
+	txt    []byte
+}
+
+func (d *int128Col) read(c *Conn, rows int) error {
+	d.buf = grow(d.buf, rows*16)
+	return c.readFull(d.buf)
+}
+
+func (d *int128Col) Kind() Kind { return KindBytes }
+
+func (d *int128Col) BytesAt(i int) []byte {
+	lo := binary.LittleEndian.Uint64(d.buf[i*16:])
+	hi := binary.LittleEndian.Uint64(d.buf[i*16+8:])
+	neg := d.signed && int64(hi) < 0
+	if neg {
+		lo = ^lo + 1
+		hi = ^hi
+		if lo == 0 {
+			hi++
+		}
+	}
+	d.txt = d.txt[:0]
+	for hi != 0 || lo != 0 || len(d.txt) == 0 {
+		var rem uint64
+		hi, rem = hi/10, hi%10
+		lo, rem = bits.Div64(rem, lo, 10)
+		d.txt = append(d.txt, byte('0'+rem))
+	}
+	if neg {
+		d.txt = append(d.txt, '-')
+	}
+	slices.Reverse(d.txt)
+	return d.txt
+}
+
+// ipCol decodes IPv4 (wire UInt32) and IPv6 (16 raw bytes) into text.
+type ipCol struct {
+	base
+	v6  bool
+	buf []byte
+	txt []byte
+}
+
+func (d *ipCol) read(c *Conn, rows int) error {
+	size := 4
+	if d.v6 {
+		size = 16
+	}
+	d.buf = grow(d.buf, rows*size)
+	return c.readFull(d.buf)
+}
+
+func (d *ipCol) Kind() Kind { return KindBytes }
+
+func (d *ipCol) BytesAt(i int) []byte {
+	var addr netip.Addr
+	if d.v6 {
+		addr = netip.AddrFrom16([16]byte(d.buf[i*16 : i*16+16]))
+	} else {
+		v := binary.LittleEndian.Uint32(d.buf[i*4:])
+		addr = netip.AddrFrom4([4]byte{byte(v >> 24), byte(v >> 16), byte(v >> 8), byte(v)})
+	}
+	d.txt = addr.AppendTo(d.txt[:0])
+	return d.txt
+}
+
+// nothingCol carries the value-free column of NULL literals; the wrapping
+// Nullable mask says everything, the payload is one placeholder byte a row.
+type nothingCol struct {
+	base
+	buf []byte
+}
+
+func (d *nothingCol) read(c *Conn, rows int) error {
+	d.buf = grow(d.buf, rows)
+	return c.readFull(d.buf)
+}
+
+func (d *nothingCol) Kind() Kind         { return KindBytes }
+func (d *nothingCol) BytesAt(int) []byte { return nil }
+
 // nullCol wraps any decoder with a null mask.
 type nullCol struct {
 	inner Decoder
@@ -406,6 +609,16 @@ func newDecoder(typ string, tz *time.Location) (Decoder, error) {
 		return &strCol{}, nil
 	case "UUID":
 		return &uuidCol{}, nil
+	case "Int128":
+		return &int128Col{signed: true}, nil
+	case "UInt128":
+		return &int128Col{}, nil
+	case "IPv4":
+		return &ipCol{}, nil
+	case "IPv6":
+		return &ipCol{v6: true}, nil
+	case "Nothing":
+		return &nothingCol{}, nil
 	case "Date":
 		return &timeCol{size: 2, dayBased: true}, nil
 	case "Date32":
@@ -450,8 +663,26 @@ func newDecoder(typ string, tz *time.Location) (Decoder, error) {
 			return nil, err
 		}
 		return &enumCol{size: 2, names: names}, nil
+	case strings.HasPrefix(typ, "Decimal"):
+		size, scale, err := parseDecimal(typ)
+		if err != nil {
+			return nil, err
+		}
+		return &decimalCol{size: size, scale: scale}, nil
+	case strings.HasPrefix(typ, "SimpleAggregateFunction("):
+		return newDecoder(simpleAggInner(typ), tz)
 	}
 	return nil, fmt.Errorf("chproto: unsupported column type %q (rio's ClickHouse surface covers scalars, strings, enums, UUID, and date/time)", typ)
+}
+
+// simpleAggInner unwraps "SimpleAggregateFunction(fn, T)" to T; the wire
+// carries plain T values.
+func simpleAggInner(typ string) string {
+	inner := strings.TrimSuffix(strings.TrimPrefix(typ, "SimpleAggregateFunction("), ")")
+	if _, t, ok := strings.Cut(inner, ","); ok {
+		return strings.TrimSpace(t)
+	}
+	return inner
 }
 
 // typeArg extracts X from "Name('X')", or returns "".

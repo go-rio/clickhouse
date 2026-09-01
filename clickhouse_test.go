@@ -7,25 +7,25 @@ import (
 )
 
 func TestParseDSN(t *testing.T) {
-	cfg, maxOpen, err := parseDSN("clickhouse://rio:secret@ch.example:19000/analytics?dial_timeout=3s&max_open_conns=4")
+	cfg, po, err := parseDSN("clickhouse://rio:secret@ch.example:19000/analytics?dial_timeout=3s&max_open_conns=4&conn_max_idle_time=90s")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if cfg.Addr != "ch.example:19000" || cfg.User != "rio" || cfg.Password != "secret" || cfg.Database != "analytics" {
 		t.Fatalf("cfg = %+v", cfg)
 	}
-	if cfg.Timeout != 3*time.Second || maxOpen != 4 || cfg.TLS != nil {
-		t.Fatalf("timeout=%v maxOpen=%d tls=%v", cfg.Timeout, maxOpen, cfg.TLS)
+	if cfg.Timeout != 3*time.Second || po.maxOpen != 4 || po.maxIdle != 90*time.Second || cfg.TLS != nil {
+		t.Fatalf("timeout=%v pool=%+v tls=%v", cfg.Timeout, po, cfg.TLS)
 	}
 }
 
 func TestParseDSNDefaults(t *testing.T) {
-	cfg, maxOpen, err := parseDSN("clickhouse://localhost")
+	cfg, po, err := parseDSN("clickhouse://localhost")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Addr != "localhost:9000" || cfg.User != "default" || cfg.Database != "default" || maxOpen != 0 {
-		t.Fatalf("cfg = %+v maxOpen=%d", cfg, maxOpen)
+	if cfg.Addr != "localhost:9000" || cfg.User != "default" || cfg.Database != "default" || po != (poolOptions{}) {
+		t.Fatalf("cfg = %+v pool=%+v", cfg, po)
 	}
 }
 

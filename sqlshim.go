@@ -68,7 +68,7 @@ func (c *shimConn) ExecContext(ctx context.Context, query string, args []driver.
 		return nil, err
 	}
 	if err := c.conn.Exec(ctx, q); err != nil {
-		return nil, err
+		return nil, badConnOr(err)
 	}
 	return driver.RowsAffected(0), nil
 }
@@ -80,9 +80,19 @@ func (c *shimConn) QueryContext(ctx context.Context, query string, args []driver
 	}
 	rows, err := c.conn.Query(ctx, q)
 	if err != nil {
-		return nil, err
+		return nil, badConnOr(err)
 	}
 	return &shimRows{rows: rows}, nil
+}
+
+// badConnOr maps transmission failures to ErrBadConn so database/sql retries
+// them on a fresh connection — the query never reached the server.
+func badConnOr(err error) error {
+	var send *chproto.SendError
+	if errors.As(err, &send) {
+		return driver.ErrBadConn
+	}
+	return err
 }
 
 func namedToAny(args []driver.NamedValue) []any {

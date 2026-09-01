@@ -46,15 +46,18 @@ events, err := rio.From[Event]().Where("kind = ?", "click").All(ctx, db)
 | `skip_verify` | skip TLS certificate verification |
 | `dial_timeout` | connect timeout, e.g. `5s` (default `10s`) |
 | `max_open_conns` | pool size (default 8) |
+| `conn_max_idle_time` | idle connection expiry, e.g. `90s` (default `5m`) |
 
 Unknown parameters are rejected.
 
 ## Supported column types
 
-Integers of every width, `Float32/64`, `Bool`, `String`, `FixedString`,
-`Enum8/16`, `UUID`, `Date`, `Date32`, `DateTime`, `DateTime64`, and
-`Nullable` of each. `LowCardinality` columns arrive as their plain type.
-`Array`, `Map`, and `Tuple` are not supported.
+Integers of every width plus `Int128`/`UInt128` (as decimal text),
+`Float32/64`, `Decimal` up to 38 digits (as fixed-scale text), `Bool`,
+`String`, `FixedString`, `Enum8/16`, `UUID`, `IPv4`/`IPv6`, `Date`,
+`Date32`, `DateTime`, `DateTime64`, `SimpleAggregateFunction` of the above,
+and `Nullable` of each. `LowCardinality` columns read and write as their
+plain type. `Array`, `Map`, and `Tuple` are not supported.
 
 ## rio on ClickHouse
 

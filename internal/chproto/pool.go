@@ -4,52 +4,74 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"time"
 )
 
 // ErrPoolClosed is returned by Acquire after Close.
 var ErrPoolClosed = errors.New("chproto: pool is closed")
 
 // Pool hands out connections one query at a time. Broken connections are
-// discarded on release; there is no background health checking — a stale
-// idle connection surfaces its error on first use and the caller retries.
+// discarded on release, and idle ones expire after maxIdle — the server and
+// middleboxes close quiet connections, so an aged one is presumed dead (and
+// its grown column buffers are memory worth returning).
 type Pool struct {
-	cfg   Config
-	slots chan struct{} // capacity = max open
+	cfg     Config
+	maxIdle time.Duration
+	slots   chan struct{} // capacity = max open
 
 	mu     sync.Mutex
-	idle   []*Conn
+	idle   []idleConn // oldest first
 	closed bool
 }
 
-// NewPool creates a pool of at most maxOpen connections; connections dial
-// lazily.
-func NewPool(cfg Config, maxOpen int) *Pool {
+type idleConn struct {
+	c     *Conn
+	since time.Time
+}
+
+// NewPool creates a pool of at most maxOpen connections that dial lazily;
+// idle connections expire after maxIdle (default five minutes).
+func NewPool(cfg Config, maxOpen int, maxIdle time.Duration) *Pool {
 	if maxOpen <= 0 {
 		maxOpen = 8
 	}
-	return &Pool{cfg: cfg, slots: make(chan struct{}, maxOpen)}
+	if maxIdle <= 0 {
+		maxIdle = 5 * time.Minute
+	}
+	return &Pool{cfg: cfg, maxIdle: maxIdle, slots: make(chan struct{}, maxOpen)}
 }
 
-// Acquire returns a connection, dialing when no idle one exists.
+// Acquire returns a connection, dialing when no live idle one exists.
 func (p *Pool) Acquire(ctx context.Context) (*Conn, error) {
 	select {
 	case p.slots <- struct{}{}:
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
+	now := time.Now()
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
 		<-p.slots
 		return nil, ErrPoolClosed
 	}
+	var expired []*Conn
+	for len(p.idle) > 0 && now.Sub(p.idle[0].since) > p.maxIdle {
+		expired = append(expired, p.idle[0].c)
+		p.idle = p.idle[1:]
+	}
+	var c *Conn
 	if n := len(p.idle); n > 0 {
-		c := p.idle[n-1]
+		c = p.idle[n-1].c
 		p.idle = p.idle[:n-1]
-		p.mu.Unlock()
-		return c, nil
 	}
 	p.mu.Unlock()
+	for _, e := range expired {
+		e.Close()
+	}
+	if c != nil {
+		return c, nil
+	}
 	c, err := Dial(ctx, p.cfg)
 	if err != nil {
 		<-p.slots
@@ -63,7 +85,7 @@ func (p *Pool) Release(c *Conn) {
 	p.mu.Lock()
 	dead := c.Broken() || p.closed
 	if !dead {
-		p.idle = append(p.idle, c)
+		p.idle = append(p.idle, idleConn{c: c, since: time.Now()})
 	}
 	p.mu.Unlock()
 	if dead {
@@ -80,8 +102,8 @@ func (p *Pool) Close() error {
 	idle := p.idle
 	p.idle = nil
 	p.mu.Unlock()
-	for _, c := range idle {
-		c.Close()
+	for _, ic := range idle {
+		ic.c.Close()
 	}
 	return nil
 }

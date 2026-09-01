@@ -216,3 +216,101 @@ func TestUnwrapServesSQLView(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// After sitting idle past the expiry, the pool must serve queries without
+// surfacing a stale-connection error.
+func TestIdleExpiryRecovers(t *testing.T) {
+	dsn := os.Getenv("RIO_CLICKHOUSE_DSN")
+	if dsn == "" {
+		t.Skip("RIO_CLICKHOUSE_DSN not set")
+	}
+	db, err := Open(context.Background(), dsn+"?conn_max_idle_time=50ms")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	for round := range 3 {
+		type row struct{ N uint64 }
+		out, err := rio.Raw[row]("SELECT 7 AS n").All(ctx, db)
+		if err != nil || len(out) != 1 || out[0].N != 7 {
+			t.Fatalf("round %d: %v %v", round, out, err)
+		}
+		time.Sleep(120 * time.Millisecond) // past expiry every round
+	}
+}
+
+type ExtType struct {
+	ID     uint64 `rio:",pk,noautoincr"`
+	Amount string // Decimal(18, 4)
+	Big    string // Int128
+	IP     string // IPv4
+	IP6    string // IPv6
+	Tag    string // LowCardinality(String)
+	Peak   int64  // SimpleAggregateFunction(max, Int64)
+}
+
+// Every type the old channel served must round-trip on the native one:
+// decimals, 128-bit integers, IP addresses, low-cardinality strings, and
+// simple aggregate wrappers.
+func TestExtendedTypesRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	db := openTest(t)
+	if _, err := rio.Exec(ctx, db, "DROP TABLE IF EXISTS ext_types"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rio.Exec(ctx, db, `CREATE TABLE ext_types (
+		id UInt64, amount Decimal(18, 4), big Int128, ip IPv4, ip6 IPv6,
+		tag LowCardinality(String), peak SimpleAggregateFunction(max, Int64),
+		created_at DateTime64(6, 'UTC'), updated_at DateTime64(6, 'UTC')
+	) ENGINE = MergeTree() ORDER BY id`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = rio.Exec(ctx, db, "DROP TABLE IF EXISTS ext_types") })
+
+	rows := []ExtType{
+		{ID: 1, Amount: "1234.5678", Big: "170141183460469231731687303715884105727", IP: "10.20.30.40", IP6: "2001:db8::1", Tag: "hot", Peak: 99},
+		{ID: 2, Amount: "-0.0001", Big: "-170141183460469231731687303715884105728", IP: "255.255.255.255", IP6: "::1", Tag: "cold", Peak: -5},
+	}
+	if err := rio.InsertAll(ctx, db, rows); err != nil { // native block path
+		t.Fatalf("InsertAll: %v", err)
+	}
+	if err := rio.Insert(ctx, db, &ExtType{ID: 3, Amount: "42.0000", Big: "7", IP: "192.168.1.1", IP6: "fe80::42", Tag: "hot", Peak: 1}); err != nil { // interpolated path
+		t.Fatalf("Insert: %v", err)
+	}
+
+	got, err := rio.From[ExtType]().OrderBy("id").All(ctx, db)
+	if err != nil {
+		t.Fatalf("All: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("rows = %d", len(got))
+	}
+	for i, want := range append(rows, ExtType{ID: 3, Amount: "42.0000", Big: "7", IP: "192.168.1.1", IP6: "fe80::42", Tag: "hot", Peak: 1}) {
+		g := got[i]
+		if g.Amount != want.Amount || g.Big != want.Big || g.IP != want.IP || g.IP6 != want.IP6 || g.Tag != want.Tag || g.Peak != want.Peak {
+			t.Fatalf("row %d drifted:\n got %+v\nwant %+v", i, g, want)
+		}
+	}
+
+	// Decimal comparisons through interpolated parameters.
+	n, err := rio.From[ExtType]().Where("amount > ?", "100").Count(ctx, db)
+	if err != nil || n != 1 {
+		t.Fatalf("decimal where: %d %v", n, err)
+	}
+}
+
+// SELECT NULL produces a Nullable(Nothing) column; scanning it into a
+// pointer must yield nil, not an unsupported-type error.
+func TestSelectNullLiteral(t *testing.T) {
+	ctx := context.Background()
+	db := openTest(t)
+	type row struct {
+		V *string
+		N uint64
+	}
+	out, err := rio.Raw[row]("SELECT NULL AS v, 42 AS n").All(ctx, db)
+	if err != nil || len(out) != 1 || out[0].V != nil || out[0].N != 42 {
+		t.Fatalf("out=%+v err=%v", out, err)
+	}
+}

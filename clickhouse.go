@@ -27,17 +27,18 @@ type Exception = chproto.Exception
 
 // Open connects the native channel and verifies it with a ping. The DSN is
 // clickhouse://user:password@host:port/database with optional parameters
-// secure, skip_verify, dial_timeout, and max_open_conns.
+// secure, skip_verify, dial_timeout, max_open_conns, and
+// conn_max_idle_time.
 //
 // The returned DB's Unwrap serves a database/sql view over its own
 // connections (what go-rio/migrate consumes); rio itself executes on the
 // protocol directly.
 func Open(ctx context.Context, dsn string, opts ...rio.Option) (*rio.DB, error) {
-	cfg, maxOpen, err := parseDSN(dsn)
+	cfg, po, err := parseDSN(dsn)
 	if err != nil {
 		return nil, err
 	}
-	pool := chproto.NewPool(cfg, maxOpen)
+	pool := chproto.NewPool(cfg, po.maxOpen, po.maxIdle)
 	if err := pool.Ping(ctx); err != nil {
 		pool.Close()
 		return nil, fmt.Errorf("clickhouse: open: %w", err)
@@ -47,14 +48,21 @@ func Open(ctx context.Context, dsn string, opts ...rio.Option) (*rio.DB, error) 
 	return rio.NewNative(rio.NativeConfig{DB: nd, Handle: pool, SQLView: view}, rio.ClickHouse, opts...), nil
 }
 
+// poolOptions carries the DSN's pool tuning.
+type poolOptions struct {
+	maxOpen int
+	maxIdle time.Duration
+}
+
 // parseDSN interprets clickhouse:// URLs.
-func parseDSN(dsn string) (chproto.Config, int, error) {
+func parseDSN(dsn string) (chproto.Config, poolOptions, error) {
+	var po poolOptions
 	u, err := url.Parse(dsn)
 	if err != nil {
-		return chproto.Config{}, 0, fmt.Errorf("clickhouse: bad DSN: %w", err)
+		return chproto.Config{}, po, fmt.Errorf("clickhouse: bad DSN: %w", err)
 	}
 	if u.Scheme != "clickhouse" {
-		return chproto.Config{}, 0, fmt.Errorf("clickhouse: bad DSN scheme %q (want clickhouse://)", u.Scheme)
+		return chproto.Config{}, po, fmt.Errorf("clickhouse: bad DSN scheme %q (want clickhouse://)", u.Scheme)
 	}
 	cfg := chproto.Config{
 		Addr:     u.Host,
@@ -74,7 +82,6 @@ func parseDSN(dsn string) (chproto.Config, int, error) {
 	if _, _, err := net.SplitHostPort(u.Host); err != nil {
 		cfg.Addr = net.JoinHostPort(u.Host, "9000")
 	}
-	var maxOpen int
 	var secure, skipVerify bool
 	for key, vals := range u.Query() {
 		val := vals[len(vals)-1]
@@ -93,18 +100,20 @@ func parseDSN(dsn string) (chproto.Config, int, error) {
 		case "dial_timeout":
 			cfg.Timeout, err = time.ParseDuration(val)
 		case "max_open_conns":
-			maxOpen, err = strconv.Atoi(val)
+			po.maxOpen, err = strconv.Atoi(val)
+		case "conn_max_idle_time":
+			po.maxIdle, err = time.ParseDuration(val)
 		default:
-			return chproto.Config{}, 0, fmt.Errorf(
-				"clickhouse: unsupported DSN parameter %q (supported: username, password, database, secure, skip_verify, dial_timeout, max_open_conns)", key)
+			return chproto.Config{}, po, fmt.Errorf(
+				"clickhouse: unsupported DSN parameter %q (supported: username, password, database, secure, skip_verify, dial_timeout, max_open_conns, conn_max_idle_time)", key)
 		}
 		if err != nil {
-			return chproto.Config{}, 0, fmt.Errorf("clickhouse: bad DSN parameter %s=%q: %w", key, val, err)
+			return chproto.Config{}, po, fmt.Errorf("clickhouse: bad DSN parameter %s=%q: %w", key, val, err)
 		}
 	}
 	if secure {
 		host, _, _ := net.SplitHostPort(cfg.Addr)
 		cfg.TLS = &tls.Config{ServerName: host, InsecureSkipVerify: skipVerify}
 	}
-	return cfg, maxOpen, nil
+	return cfg, po, nil
 }
