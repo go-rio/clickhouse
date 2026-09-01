@@ -6,10 +6,16 @@
 [![Test](https://github.com/go-rio/clickhouse/actions/workflows/test.yml/badge.svg)](https://github.com/go-rio/clickhouse/actions/workflows/test.yml)
 [![License](https://img.shields.io/github/license/go-rio/clickhouse)](https://opensource.org/license/MIT)
 
-ClickHouse driver module for [rio](https://github.com/go-rio/rio),
-implementing the ClickHouse native TCP protocol in-repo with zero
-third-party dependencies. SQL rendering and capability checks live in rio;
-this module owns the wire.
+ClickHouse driver for [rio](https://github.com/go-rio/rio), speaking the
+native TCP protocol directly.
+
+- **Zero third-party dependencies** — the wire protocol is implemented
+  in-repo; `go.mod` requires only `go-rio/rio`.
+- **Fast** — column blocks decode straight into rio's typed sinks and
+  `InsertAll` streams native column blocks: ~2× faster reads and ~3.7×
+  faster bulk inserts than the previous `clickhouse-go` channel, at one
+  allocation per row read.
+- **ClickHouse 26+**, protocol revision 54460, uncompressed.
 
 ## Getting started
 
@@ -29,49 +35,51 @@ defer db.Close()
 events, err := rio.From[Event]().Where("kind = ?", "click").All(ctx, db)
 ```
 
-DSN parameters: `username`, `password`, `database`, `secure`, `skip_verify`,
-`dial_timeout`, `max_open_conns`. Unknown parameters are rejected. The
-protocol runs uncompressed.
+## DSN
 
-## The native protocol
+`clickhouse://user:password@host:port/database` plus:
 
-The module speaks ClickHouse's native TCP protocol directly — no driver, no
-third-party dependencies. The client pins protocol revision 54460 and the
-server negotiates down to it, freezing every frame layout it implements.
-ClickHouse 26+ is the supported floor.
+| Parameter | Meaning |
+|---|---|
+| `username`, `password`, `database` | alternatives to the URL fields |
+| `secure` | TLS (`true`/`false`) |
+| `skip_verify` | skip TLS certificate verification |
+| `dial_timeout` | connect timeout, e.g. `5s` (default `10s`) |
+| `max_open_conns` | pool size (default 8) |
 
-- Result blocks decode through typed per-column readers into rio's
-  `NativeCell` sinks; buffers are reused across blocks.
-- `InsertAll` streams native column blocks (`NativeCopier`) — ClickHouse
-  never backfills, so every batch takes this path. A background reader
-  drains the response during the stream, so a server abort surfaces instead
-  of deadlocking.
-- Parameters interpolate client-side under ClickHouse quoting rules, as
-  rio's ClickHouse channel always has.
-- Server errors surface as `*clickhouse.Exception` via `errors.As`. No
-  constraint-error translator exists: ClickHouse has no unique or foreign
-  key constraints.
+Unknown parameters are rejected.
 
-Column types: integers, floats, `Bool`, `String`, `FixedString`, `Enum8/16`,
-`UUID`, `Date`, `Date32`, `DateTime`, `DateTime64`, and `Nullable` of each.
-`Array`/`Map`/`Tuple` are rejected; `LowCardinality` columns arrive as their
-plain type (the channel sets `low_cardinality_allow_in_native_format=0`).
+## Supported column types
+
+Integers of every width, `Float32/64`, `Bool`, `String`, `FixedString`,
+`Enum8/16`, `UUID`, `Date`, `Date32`, `DateTime`, `DateTime64`, and
+`Nullable` of each. `LowCardinality` columns arrive as their plain type.
+`Array`, `Map`, and `Tuple` are not supported.
+
+## rio on ClickHouse
+
+Reads support the full builder, relations, and Raw. Writes are `Insert`,
+`InsertAll`, and `Exec`; rio rejects transactions, row locks, synchronous
+update/delete, conflict upserts, and statement caching at the dialect
+level. Generated values are never backfilled — supply IDs yourself
+(`rio:",noautoincr"`). Parameters bind client-side, as this channel always
+has.
+
+Server errors are `*clickhouse.Exception` via `errors.As`. There is no
+constraint-error translator: ClickHouse has no unique or foreign key
+constraints.
 
 ## database/sql
 
-`OpenSQL` serves a plain `database/sql` handle over the same protocol — the
-surface [go-rio/migrate](https://github.com/go-rio/migrate) consumes, also
-reachable as `db.Unwrap()`. Placeholders are `?`; there are no transactions
-or prepared statements, and affected-row counts are always zero, matching
-ClickHouse itself.
+`OpenSQL` returns a plain `*sql.DB` over the same protocol — what
+[go-rio/migrate](https://github.com/go-rio/migrate) consumes, also available
+as `db.Unwrap()`. Placeholders are `?`; no transactions, no prepared
+statements, affected-row counts are always zero.
 
-## rio semantics on ClickHouse
-
-Reads support the full builder, relations, and Raw. Writes are `Insert`,
-`InsertAll`, and explicit `Exec`; rio rejects transactions, row locks,
-synchronous update/delete, conflict upserts, and statement caching at the
-dialect level. Generated values are never backfilled — supply IDs yourself
-(`rio:",noautoincr"`).
+```go
+sqlDB, err := rioch.OpenSQL(dsn)
+m, err := migrate.New(sqlDB, migrate.ClickHouse)
+```
 
 ## License
 
