@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.9.4] - 2026-09-02
+
+### Changed
+
+- rio v0.18.0.
+
 ## [0.9.3] - 2026-09-02
 
 ### Fixed
@@ -153,7 +159,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Eager DSN validation at `Open`.
 - No constraint-error translation: ClickHouse has no unique or foreign-key constraints, so rio's constraint sentinels never fire.
 
-[Unreleased]: https://github.com/go-rio/clickhouse/compare/v0.9.3...HEAD
+[Unreleased]: https://github.com/go-rio/clickhouse/compare/v0.9.4...HEAD
+[0.9.4]: https://github.com/go-rio/clickhouse/compare/v0.9.3...v0.9.4
 [0.9.3]: https://github.com/go-rio/clickhouse/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/go-rio/clickhouse/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/go-rio/clickhouse/compare/v0.9.0...v0.9.1
