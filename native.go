@@ -11,6 +11,9 @@ import (
 	"github.com/go-rio/rio"
 )
 
+// errRowsClosed is Scan's answer once Close has released the connection.
+var errRowsClosed = errors.New("clickhouse: rows are closed")
+
 // nativeDB adapts the protocol pool to rio's NativeDB SPI.
 type nativeDB struct {
 	pool *chproto.Pool
@@ -47,7 +50,7 @@ func (d *nativeDB) Query(ctx context.Context, sqlText string, args []any) (rio.N
 	if err != nil {
 		return nil, err
 	}
-	return &nativeRows{pool: d.pool, conn: c, rows: rows}, nil
+	return &nativeRows{pool: d.pool, conn: c, rows: rows, cols: rows.Names()}, nil
 }
 
 func (d *nativeDB) Exec(ctx context.Context, sqlText string, args []any) (int64, error) {
@@ -137,17 +140,21 @@ type scanStep struct {
 type nativeRows struct {
 	pool     *chproto.Pool
 	conn     *chproto.Conn
-	rows     *chproto.Rows
+	rows     *chproto.Rows // the connection's scratch; stale once released
+	cols     []string      // captured at Query; outlives the release
 	plan     []scanStep
 	released bool
 	err      error // cached by Close
 }
 
-func (r *nativeRows) Columns() []string { return r.rows.Names() }
+func (r *nativeRows) Columns() []string { return r.cols }
 
-func (r *nativeRows) Next() bool { return r.rows.Next() }
+func (r *nativeRows) Next() bool { return !r.released && r.rows.Next() }
 
 func (r *nativeRows) Scan(dest ...any) error {
+	if r.released {
+		return errRowsClosed
+	}
 	if r.plan == nil {
 		r.plan = make([]scanStep, len(dest))
 		for i, d := range dest {
