@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.9.9] - 2026-09-22
+
+### Fixed
+
+- The native block path behind `rio.InsertAll` resolves `driver.Valuer` values before encoding, as the interpolated path already did; a `Decimal` column bound from a Valuer no longer fails with "cannot bind".
+
 ## [0.9.8] - 2026-09-22
 
 ### Changed

@@ -1,11 +1,47 @@
 package chproto
 
 import (
+	"database/sql/driver"
 	"encoding/binary"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 )
+
+// textValuer binds through driver.Valuer, the way decimal libraries do.
+type textValuer struct {
+	text string
+	err  error
+}
+
+func (v textValuer) Value() (driver.Value, error) { return v.text, v.err }
+
+// A driver.Valuer binds the value it resolves to, so a Valuer-backed decimal
+// takes the text path; a failing Value aborts the row.
+func TestBindValueResolvesValuers(t *testing.T) {
+	enc, err := newEncoder("Decimal(18, 4)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, err := bindValue(textValuer{text: "12.3456"})
+	if err != nil || v != "12.3456" {
+		t.Fatalf("bindValue = %v, %v", v, err)
+	}
+	if err := enc.append(v); err != nil {
+		t.Fatalf("append resolved value: %v", err)
+	}
+	if err := enc.append(textValuer{text: "1"}); err == nil {
+		t.Fatal("an unresolved Valuer must not encode")
+	}
+	boom := errors.New("boom")
+	if _, err := bindValue(textValuer{err: boom}); !errors.Is(err, boom) {
+		t.Fatalf("Value error must surface, got %v", err)
+	}
+	if v, err := bindValue(int64(7)); err != nil || v != int64(7) {
+		t.Fatalf("plain values pass through: %v %v", v, err)
+	}
+}
 
 // Integer columns reject bindings outside their width and sign instead of
 // wrapping; an unsigned bit pattern still passes into UInt64 and UInt128.

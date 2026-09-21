@@ -2,6 +2,7 @@ package clickhouse
 
 import (
 	"context"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"os"
@@ -127,6 +128,56 @@ func TestInsertAllStreamsBlocks(t *testing.T) {
 	sum, err := rio.From[BulkItem]().Where("id <= ?", 4).Pluck[float64](ctx, db, "val")
 	if err != nil || len(sum) != 4 || sum[3] != 1.5 {
 		t.Fatalf("pluck = %v %v", sum, err)
+	}
+}
+
+// moneyText binds and scans as text through driver.Valuer and sql.Scanner,
+// the way decimal libraries do.
+type moneyText struct{ text string }
+
+func (m moneyText) Value() (driver.Value, error) { return m.text, nil }
+
+func (m *moneyText) Scan(src any) error {
+	switch v := src.(type) {
+	case string:
+		m.text = v
+	case []byte:
+		m.text = string(v)
+	default:
+		return fmt.Errorf("moneyText: cannot scan %T", src)
+	}
+	return nil
+}
+
+func TestInsertAllBindsValuers(t *testing.T) {
+	ctx := context.Background()
+	db := openTest(t)
+	if _, err := rio.Exec(ctx, db, "DROP TABLE IF EXISTS valuer_items"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rio.Exec(ctx, db, `CREATE TABLE valuer_items (
+		id UInt64, amount Decimal(18, 4)
+	) ENGINE = MergeTree() ORDER BY id`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = rio.Exec(ctx, db, "DROP TABLE IF EXISTS valuer_items") })
+
+	type ValuerItem struct {
+		ID     uint64 `rio:",pk,noautoincr"`
+		Amount moneyText
+	}
+	rows := []ValuerItem{{ID: 1, Amount: moneyText{"12.3456"}}, {ID: 2, Amount: moneyText{"-0.0001"}}}
+	if err := rio.InsertAll(ctx, db, rows); err != nil { // native block path
+		t.Fatalf("InsertAll: %v", err)
+	}
+	got, err := rio.From[ValuerItem]().OrderBy("id").All(ctx, db)
+	if err != nil || len(got) != 2 {
+		t.Fatalf("All: %v %+v", err, got)
+	}
+	for i := range rows {
+		if got[i].Amount.text != rows[i].Amount.text {
+			t.Fatalf("row %d: got %q, want %q", i, got[i].Amount.text, rows[i].Amount.text)
+		}
 	}
 }
 

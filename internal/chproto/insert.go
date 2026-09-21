@@ -2,6 +2,7 @@ package chproto
 
 import (
 	"context"
+	"database/sql/driver"
 	"encoding/binary"
 	"fmt"
 	"math"
@@ -137,15 +138,19 @@ func (in *Insert) abortErr(err error) error {
 // Columns returns the target column descriptors in insertion order.
 func (in *Insert) Columns() []Column { return in.cols }
 
-// Append adds one row; vals is only read during the call. A full buffer
-// flushes a block to the server. A value that does not fit its column fails
-// the insert and poisons the connection.
+// Append adds one row; vals is only read during the call, and a driver.Valuer
+// binds its Value. A full buffer flushes a block to the server. A value that
+// does not fit its column fails the insert and poisons the connection.
 func (in *Insert) Append(vals []any) error {
 	if len(vals) != len(in.encs) {
 		return fmt.Errorf("chproto: insert row has %d values for %d columns", len(vals), len(in.encs))
 	}
 	for i, v := range vals {
-		if err := in.encs[i].append(v); err != nil {
+		v, err := bindValue(v)
+		if err == nil {
+			err = in.encs[i].append(v)
+		}
+		if err != nil {
 			return in.conn.fail(fmt.Errorf("column %q (%s): %w", in.cols[i].Name, in.cols[i].Type, err))
 		}
 	}
@@ -193,6 +198,15 @@ func (in *Insert) Commit() error {
 	}
 	<-in.readDone
 	return in.readErr
+}
+
+// bindValue resolves a driver.Valuer to the value its column encoder reads.
+func bindValue(v any) (any, error) {
+	valuer, ok := v.(driver.Valuer)
+	if !ok {
+		return v, nil
+	}
+	return valuer.Value()
 }
 
 // --- column encoders ---
