@@ -1,7 +1,6 @@
 package chproto
 
 import (
-	"database/sql/driver"
 	"fmt"
 	"math"
 	"reflect"
@@ -131,12 +130,9 @@ func skipQuoted(s string, start int, quote byte, backslash bool) (int, bool) {
 
 // appendLiteral renders one binding as a ClickHouse literal.
 func appendLiteral(buf []byte, v any) ([]byte, error) {
-	if valuer, ok := v.(driver.Valuer); ok {
-		resolved, err := valuer.Value()
-		if err != nil {
-			return nil, err
-		}
-		v = resolved
+	v, err := bindValue(v)
+	if err != nil {
+		return nil, err
 	}
 	switch x := v.(type) {
 	case nil:

@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.9.12] - 2026-09-22
+
+### Changed
+
+- rio v0.20.2.
+
+### Fixed
+
+- A nil pointer to a value-receiver `driver.Valuer` binds NULL on both the interpolated and the native block path, as database/sql does, instead of dereferencing it.
+
 ## [0.9.11] - 2026-09-22
 
 ### Changed

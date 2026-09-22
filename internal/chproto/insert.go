@@ -200,14 +200,22 @@ func (in *Insert) Commit() error {
 	return in.readErr
 }
 
-// bindValue resolves a driver.Valuer to the value its column encoder reads.
+// bindValue resolves a driver.Valuer to the value it binds; a nil pointer to
+// a value-receiver Valuer binds NULL instead of dereferencing, as
+// database/sql does.
 func bindValue(v any) (any, error) {
 	valuer, ok := v.(driver.Valuer)
 	if !ok {
 		return v, nil
 	}
+	if rv := reflect.ValueOf(v); rv.Kind() == reflect.Pointer && rv.IsNil() &&
+		rv.Type().Elem().Implements(valuerType) {
+		return nil, nil
+	}
 	return valuer.Value()
 }
+
+var valuerType = reflect.TypeFor[driver.Valuer]()
 
 // --- column encoders ---
 

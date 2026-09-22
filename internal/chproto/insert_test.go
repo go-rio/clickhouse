@@ -41,6 +41,12 @@ func TestBindValueResolvesValuers(t *testing.T) {
 	if v, err := bindValue(int64(7)); err != nil || v != int64(7) {
 		t.Fatalf("plain values pass through: %v %v", v, err)
 	}
+	if v, err := bindValue((*textValuer)(nil)); err != nil || v != nil {
+		t.Fatalf("a nil pointer to a value-receiver Valuer binds NULL: %v %v", v, err)
+	}
+	if v, err := bindValue(&textValuer{text: "1.5"}); err != nil || v != "1.5" {
+		t.Fatalf("a live pointer resolves through the value receiver: %v %v", v, err)
+	}
 }
 
 // Integer columns reject bindings outside their width and sign instead of
